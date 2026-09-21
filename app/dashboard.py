@@ -1,4 +1,4 @@
-"""A small dashboard for exploring the synthetic UPI review queue."""
+"""A simple dashboard for the synthetic UPI transaction review queue."""
 
 from pathlib import Path
 
@@ -12,31 +12,33 @@ DATA_FILE = PROJECT_ROOT / "data" / "transactions_with_iqr_flags.csv"
 
 @st.cache_data
 def load_data() -> pd.DataFrame:
-    """Load the analysis output created by src/analyze_data.py."""
     return pd.read_csv(DATA_FILE, parse_dates=["timestamp"])
 
 
-st.set_page_config(page_title="UPI Risk Analytics", layout="wide")
-st.title("UPI Fraud Risk Analytics")
-st.caption("Student portfolio demo - all transactions and labels are synthetic.")
+st.set_page_config(page_title="UPI Review Queue", layout="wide")
+st.title("UPI Transaction Risk Review")
+st.caption("Student project - all data is synthetic.")
 
 if not DATA_FILE.exists():
-    st.error("Run `python src/generate_data.py` and `python src/analyze_data.py` first.")
+    st.error("Run the two scripts in src before opening the dashboard.")
     st.stop()
 
 data = load_data()
-flagged = data[data["iqr_amount_flag"] == 1]
+alerts = data[data["iqr_amount_alert"] == 1]
+known_high_risk = data[data["risk_flag"] == 1]
+known_examples_found = ((data["iqr_amount_alert"] == 1) & (data["risk_flag"] == 1)).sum()
 
-first_column, second_column, third_column = st.columns(3)
-first_column.metric("Total transactions", f"{len(data):,}")
-second_column.metric("Amount alerts", f"{len(flagged):,}")
-third_column.metric("Alert rate", f"{len(flagged) / len(data):.1%}")
+first, second, third = st.columns(3)
+first.metric("Transactions", f"{len(data):,}")
+second.metric("Review queue", f"{len(alerts):,}")
+third.metric("Known high-value examples found", f"{known_examples_found:,} / {len(known_high_risk):,}")
 
-st.subheader("Daily transaction value")
-daily_amount = data.set_index("timestamp").resample("D")["amount"].sum()
-st.line_chart(daily_amount)
+st.info("The IQR rule only checks transaction amount. An alert means a human should review it, not that it is fraud.")
 
-st.subheader("Top transactions in the manual-review queue")
-review_columns = ["transaction_id", "timestamp", "sender_id", "receiver_id", "amount", "merchant_category", "risk_scenario"]
-st.dataframe(flagged.sort_values("amount", ascending=False)[review_columns].head(50), use_container_width=True)
+st.subheader("Transactions each day")
+daily_transactions = data.set_index("timestamp").resample("D").size()
+st.line_chart(daily_transactions)
 
+st.subheader("Payments for manual review")
+columns_to_show = ["transaction_id", "timestamp", "sender_id", "receiver_id", "amount", "merchant_category", "review_reason"]
+st.dataframe(alerts.sort_values("amount", ascending=False)[columns_to_show].head(50), width="stretch")

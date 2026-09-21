@@ -1,67 +1,45 @@
-# UPI Fraud Risk Analytics
+# UPI Transaction Risk Review
 
-A student portfolio project that simulates UPI transactions and highlights transactions that deserve manual review.
+A student data-analytics project that finds unusually high-value UPI payments for manual review.
 
-> This project uses fully synthetic data. It is an educational risk-scoring demo, not a real fraud-prevention system.
+**Important:** every transaction in this project is synthetic. This is a learning demo, not a real fraud-prevention system.
 
-## What this project demonstrates
+## Explain it in 30 seconds
 
-- Generating a realistic-looking transaction dataset
-- Cleaning data and exploring it with Python and SQL
-- Applying an easy-to-explain IQR outlier rule
-- Building a small dashboard for a fraud-review team
+“I generated 10,000 sample UPI transactions because real payment data is private. I used the IQR method to find unusually high transaction amounts and displayed those alerts in a simple dashboard. I also measured how many deliberately injected high-value examples the rule found.”
 
-## Project structure
+## Read these three files
 
-```
-app/                 Streamlit dashboard
-data/                Generated CSV files (not real payment data)
-src/                 Python scripts
-sql/                 SQL questions and answers
-tests/               Simple checks for the generator
-```
+1. `src/generate_data.py` - creates the sample transactions.
+2. `src/analyze_data.py` - calculates the IQR limit and creates alerts.
+3. `app/dashboard.py` - shows the results in Streamlit.
 
-## Dataset fields
-
-| Field | Meaning |
-| --- | --- |
-| `transaction_id` | Unique ID for each synthetic transaction |
-| `timestamp` | Date and time of the transaction |
-| `sender_id` / `receiver_id` | Simulated customer and recipient IDs |
-| `amount` | UPI transaction value in INR |
-| `merchant_category` | Category used for the payment |
-| `location` | Simulated city label |
-| `device_type` | Device used for the transaction |
-| `upi_channel` | Channel through which the transaction was made |
-| `risk_flag` | Synthetic label used only to evaluate this demo |
-| `risk_scenario` | The pattern deliberately injected into the synthetic data |
-
-## Run the project
-
-Create a virtual environment, install the packages, then run the commands below from the project folder.
+## Run it
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python src/generate_data.py
 python src/analyze_data.py
 streamlit run app/dashboard.py
 ```
 
-## What the first version does
+## What the data contains
 
-The generator creates 10,000 transactions. Most are normal transactions. A small number contain one deliberately injected review pattern: an unusually high amount, a late-night payment, or a rapid repeat payment.
+`transaction_id`, `timestamp`, `sender_id`, `receiver_id`, `amount`, `merchant_category`, `location`, `device_type`, and `upi_channel`.
 
-`analyze_data.py` uses the IQR rule to flag unusually large amounts. The dashboard shows the transaction trend, amount distribution, and the review queue.
+Three percent of the sample payments are deliberately made very high in value. `risk_flag` is included only to check whether the IQR rule found those known synthetic examples. A real reviewer would not see that label.
+
+## What IQR means
+
+IQR is a basic method for finding unusually large or small values. This project calculates an upper amount limit from the normal transactions. Any payment above that limit is placed in the review queue.
 
 ## Limitations
 
-- Fraud labels are synthetic, so the results do not prove real-world accuracy.
-- IQR looks only at transaction amount; it cannot find every suspicious pattern.
-- A real payment-risk system needs privacy controls, human review, monitoring, and access to trustworthy historical data.
+- Synthetic labels cannot prove real-world fraud accuracy.
+- Amount alone is not enough to identify fraud.
+- An alert means “review this payment,” not “this payment is fraud.”
 
-## Interview explanation
+## Next improvement
 
-“I built a UPI transaction-risk analytics demo using simulated data because real payment fraud data is private. I first explored the data with SQL and Python, then used the IQR method to find unusually high transactions. The dashboard helps a review team see which alerts need attention. I clearly documented that the labels and results are synthetic.”
+Add time-of-day or repeat-payment rules after the first version is fully understood.
 

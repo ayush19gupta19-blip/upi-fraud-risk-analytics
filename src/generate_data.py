@@ -1,8 +1,4 @@
-"""Create a small, reproducible synthetic UPI transaction dataset.
-
-The labels in this file are deliberately injected for learning and evaluation.
-They are not real fraud labels.
-"""
+"""Generate a small synthetic UPI transaction dataset for this project."""
 
 from pathlib import Path
 
@@ -12,80 +8,46 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_FILE = PROJECT_ROOT / "data" / "upi_transactions.csv"
-RANDOM_SEED = 42
-NUMBER_OF_TRANSACTIONS = 10_000
 
 
-def build_base_transactions(number_of_transactions: int, seed: int) -> pd.DataFrame:
-    """Create ordinary-looking transactions before adding review scenarios."""
-    rng = np.random.default_rng(seed)
+def generate_transactions(transaction_count: int = 10_000, seed: int = 42) -> pd.DataFrame:
+    """Create normal payments, then add a few known high-value examples."""
+    random = np.random.default_rng(seed)
     timestamps = pd.Timestamp("2026-01-01") + pd.to_timedelta(
-        rng.integers(0, 90 * 24 * 60, number_of_transactions), unit="m"
+        random.integers(0, 90 * 24 * 60, transaction_count), unit="m"
     )
 
-    data = pd.DataFrame(
+    transactions = pd.DataFrame(
         {
-            "transaction_id": [f"TXN{i:06d}" for i in range(1, number_of_transactions + 1)],
+            "transaction_id": [f"TXN{i:06d}" for i in range(1, transaction_count + 1)],
             "timestamp": timestamps,
-            "sender_id": [f"USER{value:04d}" for value in rng.integers(1, 1001, number_of_transactions)],
-            "receiver_id": [f"REC{value:04d}" for value in rng.integers(1, 501, number_of_transactions)],
-            "amount": np.round(np.clip(rng.lognormal(mean=6.3, sigma=0.75, size=number_of_transactions), 10, 12_000), 2),
-            "merchant_category": rng.choice(
-                ["Groceries", "Food", "Travel", "Bills", "Shopping", "Transfer"],
-                size=number_of_transactions,
-                p=[0.24, 0.23, 0.08, 0.15, 0.17, 0.13],
-            ),
-            "location": rng.choice(["Delhi", "Mumbai", "Bengaluru", "Pune", "Hyderabad", "Chennai"], size=number_of_transactions),
-            "device_type": rng.choice(["Android", "iOS"], size=number_of_transactions, p=[0.76, 0.24]),
-            "upi_channel": rng.choice(["App", "QR", "Collect Request"], size=number_of_transactions, p=[0.52, 0.4, 0.08]),
+            "sender_id": [f"USER{i:04d}" for i in random.integers(1, 1001, transaction_count)],
+            "receiver_id": [f"REC{i:04d}" for i in random.integers(1, 501, transaction_count)],
+            "amount": np.round(np.clip(random.normal(650, 250, transaction_count), 50, 2_000), 2),
+            "merchant_category": random.choice(["Food", "Groceries", "Bills", "Shopping", "Travel"], transaction_count),
+            "location": random.choice(["Delhi", "Mumbai", "Bengaluru", "Pune", "Hyderabad"], transaction_count),
+            "device_type": random.choice(["Android", "iOS"], transaction_count, p=[0.75, 0.25]),
+            "upi_channel": random.choice(["App", "QR", "Collect Request"], transaction_count, p=[0.55, 0.4, 0.05]),
             "risk_flag": 0,
-            "risk_scenario": "normal",
         }
     )
-    return data.sort_values("timestamp").reset_index(drop=True)
 
+    # These are deliberately high payments used only to check the demo rule.
+    high_risk_count = max(1, round(transaction_count * 0.03))
+    high_risk_rows = random.choice(transactions.index, size=high_risk_count, replace=False)
+    transactions.loc[high_risk_rows, "amount"] = np.round(random.uniform(15_000, 45_000, high_risk_count), 2)
+    transactions.loc[high_risk_rows, "risk_flag"] = 1
 
-def inject_review_scenarios(data: pd.DataFrame, seed: int) -> pd.DataFrame:
-    """Add a few known patterns so students can test their analysis."""
-    rng = np.random.default_rng(seed + 1)
-    data = data.copy()
-    # Three percent keeps the number of review cases small but visible.
-    # The minimum of three also lets the function work with tiny test datasets.
-    number_of_review_rows = min(len(data), max(3, round(len(data) * 0.03)))
-    selected_rows = rng.choice(data.index, size=number_of_review_rows, replace=False)
-    high_amount_rows, late_night_rows, repeat_payment_rows = np.array_split(selected_rows, 3)
-
-    data.loc[high_amount_rows, "amount"] = np.round(rng.uniform(15_000, 45_000, len(high_amount_rows)), 2)
-    data.loc[high_amount_rows, "risk_scenario"] = "unusually_high_amount"
-
-    data.loc[late_night_rows, "timestamp"] = (
-        pd.to_datetime(data.loc[late_night_rows, "timestamp"]).dt.normalize()
-        + pd.to_timedelta(rng.integers(0, 5 * 60, len(late_night_rows)), unit="m")
-    )
-    data.loc[late_night_rows, "risk_scenario"] = "late_night_payment"
-
-    data.loc[repeat_payment_rows, "receiver_id"] = "REC0001"
-    data.loc[repeat_payment_rows, "timestamp"] = pd.Timestamp("2026-03-15 14:00:00") + pd.to_timedelta(
-        rng.integers(0, 30, len(repeat_payment_rows)), unit="m"
-    )
-    data.loc[repeat_payment_rows, "risk_scenario"] = "rapid_repeat_payment"
-
-    data.loc[selected_rows, "risk_flag"] = 1
-    return data.sort_values("timestamp").reset_index(drop=True)
-
-
-def create_dataset(number_of_transactions: int = NUMBER_OF_TRANSACTIONS, seed: int = RANDOM_SEED) -> pd.DataFrame:
-    """Build the full reproducible dataset."""
-    base_data = build_base_transactions(number_of_transactions, seed)
-    return inject_review_scenarios(base_data, seed)
+    return transactions.sort_values("timestamp").reset_index(drop=True)
 
 
 def main() -> None:
     OUTPUT_FILE.parent.mkdir(exist_ok=True)
-    data = create_dataset()
-    data.to_csv(OUTPUT_FILE, index=False)
-    print(f"Created {len(data):,} transactions at {OUTPUT_FILE}")
-    print(data["risk_scenario"].value_counts().to_string())
+    transactions = generate_transactions()
+    transactions.to_csv(OUTPUT_FILE, index=False)
+    print(f"Created {len(transactions):,} synthetic transactions.")
+    print(f"Known high-value examples added: {transactions['risk_flag'].sum():,}")
+    print(f"Saved file: {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
