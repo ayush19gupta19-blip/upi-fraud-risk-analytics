@@ -3,6 +3,7 @@
 from pathlib import Path
 import sqlite3
 import sys
+import tempfile
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -18,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.analyze_data import explain_transaction, score_uploaded_transactions, validate_transaction_upload
+from src.sql_lab import execute_query
 
 st.set_page_config(
     page_title="UPI Risk Guardian - Fraud Analytics",
@@ -75,14 +77,18 @@ def load_transaction_data() -> pd.DataFrame:
 
 
 @st.cache_resource
-def get_sqlite_connection(df: pd.DataFrame) -> sqlite3.Connection:
-    """Create an in-memory SQLite database populated with transaction records."""
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    # Convert timestamp to string for sqlite compatibility
-    df_sql = df.copy()
-    df_sql["timestamp"] = df_sql["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    df_sql.to_sql("upi_transactions", conn, if_exists="replace", index=False)
-    return conn
+def get_sqlite_database(df: pd.DataFrame) -> tempfile.TemporaryDirectory:
+    """Cache a private snapshot; each query opens its own read-only connection."""
+    directory = tempfile.TemporaryDirectory(prefix="upi-sql-")
+    conn = sqlite3.connect(Path(directory.name) / "transactions.sqlite")
+    try:
+        df_sql = df.copy()
+        df_sql["timestamp"] = df_sql["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        df_sql.to_sql("upi_transactions", conn, if_exists="replace", index=False)
+    finally:
+        conn.close()
+    # Keep the directory alive for as long as Streamlit caches the snapshot.
+    return directory
 
 
 @st.cache_data(show_spinner="Scoring your data with the risk engine...")
@@ -529,9 +535,9 @@ with tab_ml_benchmark:
 # ================= TAB 4: SQL LAB =================
 with tab_sql:
     st.subheader("SQL Analytics Lab (SQLite Engine)")
-    st.caption("Directly test and run SQL queries against the active dataset.")
+    st.caption("Read-only queries · 2-second execution budget · maximum 1,000 rows and 1 MiB per result.")
 
-    conn = get_sqlite_connection(raw_df)
+    database = get_sqlite_database(raw_df)
 
     queries = {
         "1. Merchant Category Volume & Total Spend": """
@@ -597,7 +603,8 @@ LIMIT 10;
 
     if st.button("▶️ Execute Query", key="btn_run_sql"):
         try:
-            sql_result = pd.read_sql_query(sql_text, conn)
+            result = execute_query(Path(database.name) / "transactions.sqlite", sql_text)
+            sql_result = pd.DataFrame(result["rows"], columns=result["columns"])
             st.success(f"Query returned {len(sql_result):,} rows.")
             st.dataframe(sql_result, use_container_width=True)
         except Exception as e:
