@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sqlite3
+import sys
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -11,6 +12,12 @@ import plotly.graph_objects as go
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_FILE = PROJECT_ROOT / "data" / "transactions_with_iqr_flags.csv"
 RAW_DATA_FILE = PROJECT_ROOT / "data" / "upi_transactions.csv"
+
+# Make the repo root importable so the scoring engine can be reused directly
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.analyze_data import explain_transaction, score_uploaded_transactions, validate_transaction_upload
 
 st.set_page_config(
     page_title="UPI Risk Guardian - Fraud Analytics",
@@ -78,6 +85,63 @@ def get_sqlite_connection(df: pd.DataFrame) -> sqlite3.Connection:
     return conn
 
 
+@st.cache_data(show_spinner="Scoring your data with the risk engine...")
+def score_upload_cached(uploaded_df: pd.DataFrame, multiplier: float) -> tuple[pd.DataFrame, float]:
+    """Cached wrapper so re-renders don't re-score an unchanged upload."""
+    return score_uploaded_transactions(uploaded_df, iqr_multiplier=multiplier)
+
+
+def render_explanation(row: pd.Series, iqr_upper_limit: float) -> None:
+    """Render the per-rule score breakdown backing one transaction's risk score."""
+    explanation = explain_transaction(
+        row,
+        iqr_upper_limit=iqr_upper_limit,
+        velocity_window_mins=15,
+        velocity_threshold=3,
+    )
+
+    summary_c1, summary_c2 = st.columns([3, 2])
+    with summary_c1:
+        st.markdown(
+            f"**Composite score: {explanation['risk_score']}/100 → {explanation['risk_level']} risk tier**"
+            f" · {explanation['fired_rules']} of {explanation['total_rules']} rules fired"
+        )
+    with summary_c2:
+        if explanation["next_tier"] is not None:
+            st.caption(
+                f"{explanation['next_tier']['points_needed']} more points would escalate to "
+                f"**{explanation['next_tier']['tier']}** (threshold {explanation['next_tier']['threshold']})."
+            )
+        else:
+            st.caption("Already at the highest risk tier — no escalation needed.")
+
+    breakdown = pd.DataFrame(explanation["rules"])
+    fig_rules = go.Figure(
+        go.Bar(
+            x=breakdown["max_points"],
+            y=breakdown["label"],
+            orientation="h",
+            marker_color=["#dc2626" if fired else "#e2e8f0" for fired in breakdown["fired"]],
+            text=[f"{points} pts" for points in breakdown["points"]],
+            textposition="outside",
+            hovertemplate="%{y}: %{x} pts<extra></extra>",
+        )
+    )
+    fig_rules.update_layout(
+        height=230,
+        margin=dict(l=10, r=40, t=10, b=10),
+        xaxis=dict(title="Rule weight (points)", range=[0, 50]),
+        showlegend=False,
+    )
+    st.plotly_chart(fig_rules, use_container_width=True)
+
+    for rule in explanation["rules"]:
+        icon = "🔴" if rule["fired"] else "⚪"
+        st.markdown(
+            f"{icon} **{rule['label']}** `{rule['points']}/{rule['max_points']} pts` — {rule['detail']}"
+        )
+
+
 if not DATA_FILE.exists():
     st.error("Missing enriched data file. Run `python src/generate_data.py` and `python src/analyze_data.py` first.")
     st.stop()
@@ -132,6 +196,9 @@ q3 = raw_df["amount"].quantile(0.75)
 dynamic_iqr_limit = q3 + iqr_mult * (q3 - q1)
 st.sidebar.caption(f"Dynamic Upper Cutoff: **INR {dynamic_iqr_limit:,.2f}**")
 
+# Cutoff the shipped dataset was scored with (engine default 1.5x) — used for explainability details
+generated_iqr_limit = q3 + 1.5 * (q3 - q1)
+
 # Apply Filters
 mask = (
     (raw_df["upi_channel"].isin(selected_channels))
@@ -175,11 +242,12 @@ c5.metric("Total Volume", f"INR {total_volume / 1e6:.2f}M")
 st.markdown("---")
 
 # ----------------- TABS LAYOUT -----------------
-tab_queue, tab_analytics, tab_ml_benchmark, tab_sql = st.tabs([
+tab_queue, tab_analytics, tab_ml_benchmark, tab_sql, tab_upload = st.tabs([
     "🚨 Operational Review Queue",
     "📈 Risk Analytics & Patterns",
     "🤖 ML vs. Rule Benchmark",
     "🗄️ Interactive SQL Lab",
+    "📤 Score Your Own CSV",
 ])
 
 # ================= TAB 1: OPERATIONAL REVIEW QUEUE =================
@@ -267,6 +335,11 @@ with tab_queue:
                     st.session_state.analyst_actions[selected_tx] = "Blocked 🚫"
                     st.error(f"{selected_tx} sender frozen!")
                     st.rerun()
+
+        # Per-transaction explainability: exactly why this score, rule by rule
+        st.markdown("---")
+        with st.expander(f"🧬 Explainability Breakdown — {selected_tx}", expanded=True):
+            render_explanation(tx_row, generated_iqr_limit)
 
 
 # ================= TAB 2: RISK ANALYTICS & PATTERNS =================
@@ -529,3 +602,98 @@ LIMIT 10;
             st.dataframe(sql_result, use_container_width=True)
         except Exception as e:
             st.error(f"SQL Execution Error: {e}")
+
+
+# ================= TAB 5: SCORE YOUR OWN CSV =================
+with tab_upload:
+    st.subheader("Score Your Own Transaction CSV")
+    st.caption(
+        "**Required columns:** `timestamp`, `amount`, `sender_id`, `receiver_id`, `upi_channel` — "
+        "**optional:** `merchant_category` + `device_type` (enables the Isolation Forest benchmark). "
+        f"No `transaction_id`? One is generated for you. Sample file to try: `{RAW_DATA_FILE.name}`."
+    )
+
+    uploaded_file = st.file_uploader("Upload a transactions CSV", type=["csv"], key="csv_uploader")
+
+    if uploaded_file is None:
+        st.info(
+            "Upload a CSV to have the explainable rule engine score it live "
+            "with your current IQR multiplier setting from the sidebar."
+        )
+    else:
+        try:
+            uploaded_df = pd.read_csv(uploaded_file)
+        except Exception as exc:
+            st.error(f"Could not parse the CSV: {exc}")
+            uploaded_df = None
+
+        if uploaded_df is not None:
+            upload_problems = validate_transaction_upload(uploaded_df)
+            if upload_problems:
+                for problem in upload_problems:
+                    st.error(problem)
+            else:
+                try:
+                    scored_df, upload_iqr_limit = score_upload_cached(uploaded_df, float(iqr_mult))
+                except Exception as exc:
+                    st.error(f"Scoring failed: {exc}")
+                    scored_df = None
+
+                if scored_df is not None:
+                    # KPI row for the uploaded batch
+                    k1, k2, k3, k4 = st.columns(4)
+                    queue_rate = (scored_df["in_review_queue"] == 1).mean() * 100
+                    k1.metric("Rows Scored", f"{len(scored_df):,}")
+                    k2.metric(
+                        "In Review Queue",
+                        f"{int((scored_df['in_review_queue'] == 1).sum()):,}",
+                        f"{queue_rate:.1f}% queue rate",
+                    )
+                    k3.metric("High-Risk Alerts", f"{int((scored_df['risk_level'] == 'High').sum()):,}", delta_color="inverse")
+                    k4.metric("IQR Cutoff", f"INR {upload_iqr_limit:,.2f}")
+
+                    if "ml_prediction" not in scored_df.columns:
+                        st.info(
+                            "Isolation Forest benchmark skipped — add `merchant_category` and "
+                            "`device_type` columns to enable it."
+                        )
+
+                    upload_cols = [
+                        col
+                        for col in (
+                            "transaction_id", "timestamp", "sender_id", "receiver_id", "amount",
+                            "upi_channel", "risk_score", "risk_level", "review_reason",
+                        )
+                        if col in scored_df.columns
+                    ]
+                    st.dataframe(
+                        scored_df.sort_values("risk_score", ascending=False)[upload_cols].head(200),
+                        use_container_width=True,
+                        column_config={
+                            "amount": st.column_config.NumberColumn("Amount (INR)", format="₹ %.2f"),
+                            "risk_score": st.column_config.ProgressColumn(
+                                "Risk Score", min_value=0, max_value=100, format="%d pts"
+                            ),
+                            "timestamp": st.column_config.DatetimeColumn("Timestamp", format="D MMM YYYY, HH:mm"),
+                        },
+                        height=380,
+                    )
+
+                    # Explainability for any row in the uploaded batch
+                    st.markdown("#### 🧬 Explain a Scored Transaction")
+                    score_options = (
+                        scored_df.sort_values("risk_score", ascending=False)["transaction_id"].head(50).tolist()
+                    )
+                    chosen_upload_tx = st.selectbox(
+                        "Transaction to explain", options=score_options, key="upload_explain"
+                    )
+                    if chosen_upload_tx:
+                        upload_row = scored_df[scored_df["transaction_id"] == chosen_upload_tx].iloc[0]
+                        render_explanation(upload_row, upload_iqr_limit)
+
+                    st.download_button(
+                        "⬇️ Download Scored CSV",
+                        data=scored_df.to_csv(index=False).encode("utf-8"),
+                        file_name="scored_transactions.csv",
+                        mime="text/csv",
+                    )

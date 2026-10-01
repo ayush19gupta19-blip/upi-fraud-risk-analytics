@@ -9,6 +9,24 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INPUT_FILE = PROJECT_ROOT / "data" / "upi_transactions.csv"
 OUTPUT_FILE = PROJECT_ROOT / "data" / "transactions_with_iqr_flags.csv"
 
+# Composite risk rule weights (points out of 100). Single source of truth for
+# both scoring and per-transaction explainability.
+RULE_WEIGHTS: dict[str, int] = {
+    "iqr_amount_alert": 40,   # Amount outlier vs Tukey IQR fence
+    "velocity_alert": 30,     # Rapid-fire transactions by the same sender
+    "collect_scam_alert": 20, # High-value Collect Request (phishing vector)
+    "odd_hours_alert": 10,    # Elevated amount inside the 01:00-05:00 window
+}
+
+# Composite score thresholds for each risk tier
+RISK_TIER_THRESHOLDS: dict[str, int] = {"Medium": 30, "High": 60}
+
+# Columns a user-supplied CSV must contain to be scoreable
+REQUIRED_UPLOAD_COLUMNS = ["timestamp", "amount", "sender_id", "receiver_id", "upi_channel"]
+
+# Extra columns needed for the Isolation Forest benchmark (optional on upload)
+ML_FEATURE_COLUMNS = ["merchant_category", "device_type"]
+
 
 def calculate_iqr_limit(amounts: pd.Series, multiplier: float = 1.5) -> float:
     """Calculate the upper outlier cutoff using Tukey's IQR fence method."""
@@ -70,19 +88,15 @@ def evaluate_rules(
         (df["upi_channel"] == "Collect Request") & (df["amount"] >= 5_000)
     ).astype(int)
 
-    # 5. Composite Risk Score (0 to 100)
-    # Amount IQR: 40 pts, Velocity: 30 pts, Collect Scam: 20 pts, Odd Hours: 10 pts
-    df["risk_score"] = (
-        df["iqr_amount_alert"] * 40
-        + df["velocity_alert"] * 30
-        + df["collect_scam_alert"] * 20
-        + df["odd_hours_alert"] * 10
+    # 5. Composite Risk Score (0 to 100) from the weighted rule set
+    df["risk_score"] = sum(
+        df[column] * weight for column, weight in RULE_WEIGHTS.items()
     ).clip(0, 100)
 
     # Categorical Risk Level
     conditions = [
-        df["risk_score"] >= 60,
-        df["risk_score"] >= 30,
+        df["risk_score"] >= RISK_TIER_THRESHOLDS["High"],
+        df["risk_score"] >= RISK_TIER_THRESHOLDS["Medium"],
     ]
     choices = ["High", "Medium"]
     df["risk_level"] = np.select(conditions, choices, default="Low")
@@ -105,6 +119,84 @@ def evaluate_rules(
     df["in_review_queue"] = (df["risk_score"] >= 30).astype(int)
 
     return df, upper_limit
+
+
+def explain_transaction(
+    row: pd.Series,
+    iqr_upper_limit: float | None = None,
+    velocity_window_mins: int = 15,
+    velocity_threshold: int = 3,
+) -> dict:
+    """Break a scored transaction's composite risk score into per-rule contributions.
+
+    Returns an audit-ready dict: the score and tier, a per-rule breakdown
+    (fired / points / plain-English detail), and the gap to the next tier.
+    """
+    amount = float(row.get("amount", 0.0) or 0.0)
+    rolling_count = int(row.get("rolling_tx_count", 1) or 1)
+    hour = int(row.get("hour_of_day", 0) or 0)
+
+    labels = {
+        "iqr_amount_alert": "Amount IQR Outlier",
+        "velocity_alert": "Rolling Velocity Spike",
+        "collect_scam_alert": "Collect Request Scam",
+        "odd_hours_alert": "Odd-Hours Activity",
+    }
+    cutoff_text = f" of INR {iqr_upper_limit:,.2f}" if iqr_upper_limit is not None else ""
+    details = {
+        "iqr_amount_alert": f"Amount INR {amount:,.2f} exceeds the Tukey IQR cutoff{cutoff_text}",
+        "velocity_alert": (
+            f"{rolling_count} transactions by this sender within a {velocity_window_mins}-minute "
+            f"window (fires at >= {velocity_threshold})"
+        ),
+        "collect_scam_alert": (
+            f"Collect Request of INR {amount:,.2f} is at or above the INR 5,000 scam threshold"
+        ),
+        "odd_hours_alert": (
+            f"INR {amount:,.2f} moved at {hour:02d}:00 (01:00-05:00 window with amount > INR 1,500)"
+        ),
+    }
+
+    rules = []
+    for column, weight in RULE_WEIGHTS.items():
+        fired = int(row.get(column, 0) or 0) == 1
+        rules.append(
+            {
+                "label": labels[column],
+                "column": column,
+                "fired": fired,
+                "points": weight if fired else 0,
+                "max_points": weight,
+                "detail": details[column]
+                if fired
+                else f"Not triggered (worth {weight} pts if it fires)",
+            }
+        )
+    # Fired rules first, then by descending weight
+    rules.sort(key=lambda rule: (not rule["fired"], -rule["max_points"]))
+
+    score = int(row.get("risk_score", sum(rule["points"] for rule in rules)))
+
+    next_tier = None
+    for tier in ("Medium", "High"):
+        threshold = RISK_TIER_THRESHOLDS[tier]
+        if score < threshold:
+            next_tier = {"tier": tier, "threshold": threshold, "points_needed": threshold - score}
+            break
+
+    risk_level = row.get("risk_level")
+    if risk_level is None:
+        risk_level = "High" if score >= RISK_TIER_THRESHOLDS["High"] else "Medium" if score >= RISK_TIER_THRESHOLDS["Medium"] else "Low"
+
+    return {
+        "transaction_id": row.get("transaction_id"),
+        "risk_score": score,
+        "risk_level": str(risk_level),
+        "fired_rules": sum(1 for rule in rules if rule["fired"]),
+        "total_rules": len(rules),
+        "rules": rules,
+        "next_tier": next_tier,
+    }
 
 
 def train_isolation_forest(df: pd.DataFrame, contamination: float = 0.035, seed: int = 42) -> pd.DataFrame:
@@ -171,6 +263,69 @@ def add_iqr_alerts(transactions: pd.DataFrame) -> tuple[pd.DataFrame, float]:
     df, upper_limit = evaluate_rules(transactions)
     df = train_isolation_forest(df)
     return df, upper_limit
+
+
+def validate_transaction_upload(df: pd.DataFrame) -> list[str]:
+    """Validate a user-supplied transaction frame.
+
+    Returns a list of human-readable problems; an empty list means the data
+    can be scored by the rule engine.
+    """
+    problems: list[str] = []
+
+    missing = [column for column in REQUIRED_UPLOAD_COLUMNS if column not in df.columns]
+    if missing:
+        found = ", ".join(map(str, df.columns)) if len(df.columns) else "none"
+        problems.append(f"Missing required column(s): {', '.join(missing)}. Found: {found}.")
+
+    if len(df) == 0:
+        problems.append("The file contains no transaction rows.")
+        return problems
+
+    if "amount" in df.columns:
+        amounts = pd.to_numeric(df["amount"], errors="coerce")
+        if amounts.isna().any():
+            problems.append(f"'amount' has {int(amounts.isna().sum())} value(s) that are not numeric.")
+        elif (amounts <= 0).any():
+            problems.append("'amount' must be strictly positive.")
+
+    if "timestamp" in df.columns:
+        parsed = pd.to_datetime(df["timestamp"], errors="coerce", format="mixed")
+        if parsed.isna().any():
+            problems.append(
+                f"'timestamp' has {int(parsed.isna().sum())} value(s) that could not be parsed as dates."
+            )
+
+    return problems
+
+
+def score_uploaded_transactions(
+    df: pd.DataFrame,
+    iqr_multiplier: float = 1.5,
+) -> tuple[pd.DataFrame, float]:
+    """Score a user-supplied transaction frame with the explainable rule engine.
+
+    Runs the Isolation Forest benchmark as well when the optional feature
+    columns (merchant_category, device_type) are present.
+    Raises ValueError listing every validation problem when the data is unusable.
+    """
+    problems = validate_transaction_upload(df)
+    if problems:
+        raise ValueError("\n".join(problems))
+
+    scored = df.copy()
+    scored["timestamp"] = pd.to_datetime(scored["timestamp"], errors="coerce", format="mixed")
+    scored["amount"] = pd.to_numeric(scored["amount"], errors="coerce")
+
+    if "transaction_id" not in scored.columns:
+        scored.insert(0, "transaction_id", [f"UPLOAD{i:05d}" for i in range(1, len(scored) + 1)])
+
+    scored, upper_limit = evaluate_rules(scored, iqr_multiplier=iqr_multiplier)
+
+    if all(column in scored.columns for column in ML_FEATURE_COLUMNS):
+        scored = train_isolation_forest(scored)
+
+    return scored, upper_limit
 
 
 def main() -> None:
