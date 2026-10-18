@@ -69,31 +69,44 @@ def generate_transactions(transaction_count: int = 10_000, seed: int = 42) -> pd
         }
     )
 
-    # 1. Injected High-Value Spikes (~1.8% of transactions)
-    high_value_count = max(1, round(transaction_count * 0.018))
-    high_value_indices = random.choice(transactions.index, size=high_value_count, replace=False)
-    transactions.loc[high_value_indices, "amount"] = np.round(random.uniform(15_000, 48_000, high_value_count), 2)
-    transactions.loc[high_value_indices, "anomaly_type"] = "high_value"
-    transactions.loc[high_value_indices, "risk_flag"] = 1
+    # 1. Injected Velocity Bursts (~0.6% burst events: same sender draining account in rapid succession)
+    # Select all rows up front and explicitly build groups of three. The old
+    # implementation looked for two other rows that happened to share the
+    # selected sender, so many seeds produced no detectable burst at all.
+    velocity_event_count = min(
+        max(1, round(transaction_count * 0.002)) if transaction_count >= 3 else 0,
+        transaction_count // 3,
+    )
+    if velocity_event_count:
+        burst_indices = random.choice(
+            transactions.index.to_numpy(),
+            size=velocity_event_count * 3,
+            replace=False,
+        )
 
-    # 2. Injected Velocity Bursts (~0.6% burst events: same sender draining account in rapid succession)
-    velocity_event_count = max(1, round(transaction_count * 0.002))
+        for event_number, group_start in enumerate(range(0, len(burst_indices), 3), start=1):
+            burst_group = burst_indices[group_start : group_start + 3]
+            base_ts = transactions.at[burst_group[0], "timestamp"]
+            # Keep the same ID shape as the normal synthetic users while
+            # allocating IDs outside the base USER0001-USER1000 pool.
+            burst_sender = f"USER{1000 + event_number:04d}"
+
+            for step, row_index in enumerate(burst_group):
+                transactions.at[row_index, "sender_id"] = burst_sender
+                transactions.at[row_index, "timestamp"] = base_ts + pd.Timedelta(minutes=step * 2)
+                transactions.at[row_index, "anomaly_type"] = "velocity_burst"
+                transactions.at[row_index, "risk_flag"] = 1
+
+    # 2. Injected High-Value Spikes (~1.8% of transactions)
     available_indices = transactions[transactions["risk_flag"] == 0].index
-    burst_start_indices = random.choice(available_indices, size=velocity_event_count, replace=False)
-
-    for idx in burst_start_indices:
-        sender = transactions.at[idx, "sender_id"]
-        base_ts = transactions.at[idx, "timestamp"]
-        # Create 2 additional rapid payments for this sender within 3-8 minutes
-        other_indices = transactions[(transactions["sender_id"] == sender) & (transactions.index != idx)].index
-        if len(other_indices) >= 2:
-            burst_sub = other_indices[:2]
-            for step, sub_idx in enumerate(burst_sub, start=1):
-                transactions.at[sub_idx, "timestamp"] = base_ts + pd.Timedelta(minutes=step * 2 + int(random.integers(1, 3)))
-                transactions.at[sub_idx, "anomaly_type"] = "velocity_burst"
-                transactions.at[sub_idx, "risk_flag"] = 1
-            transactions.at[idx, "anomaly_type"] = "velocity_burst"
-            transactions.at[idx, "risk_flag"] = 1
+    high_value_count = min(max(1, round(transaction_count * 0.018)), len(available_indices))
+    if high_value_count:
+        high_value_indices = random.choice(available_indices, size=high_value_count, replace=False)
+        transactions.loc[high_value_indices, "amount"] = np.round(
+            random.uniform(15_000, 48_000, high_value_count), 2
+        )
+        transactions.loc[high_value_indices, "anomaly_type"] = "high_value"
+        transactions.loc[high_value_indices, "risk_flag"] = 1
 
     # 3. Injected Collect-Request Phishing Scams (~0.6% high amounts via Collect Request)
     collect_candidates = transactions[(transactions["risk_flag"] == 0) & (transactions["upi_channel"] == "Collect Request")].index

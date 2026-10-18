@@ -3,6 +3,7 @@
 from pathlib import Path
 import sqlite3
 import sys
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -17,7 +18,12 @@ RAW_DATA_FILE = PROJECT_ROOT / "data" / "upi_transactions.csv"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.analyze_data import explain_transaction, score_uploaded_transactions, validate_transaction_upload
+from src.analyze_data import (
+    evaluate_rules,
+    explain_transaction,
+    score_uploaded_transactions,
+    validate_transaction_upload,
+)
 
 st.set_page_config(
     page_title="UPI Risk Guardian - Fraud Analytics",
@@ -85,6 +91,72 @@ def get_sqlite_connection(df: pd.DataFrame) -> sqlite3.Connection:
     return conn
 
 
+@st.cache_resource
+def get_actions_connection() -> sqlite3.Connection:
+    """Open the local analyst-decision store and create its schema."""
+    db_path = PROJECT_ROOT / "data" / "analyst_actions.sqlite3"
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analyst_actions (
+            transaction_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def load_analyst_actions() -> dict[str, str]:
+    """Load persisted decisions for display in the review queue."""
+    rows = get_actions_connection().execute(
+        "SELECT transaction_id, status FROM analyst_actions"
+    ).fetchall()
+    return {transaction_id: status for transaction_id, status in rows}
+
+
+def save_analyst_action(transaction_id: str, status: str) -> None:
+    """Persist one analyst decision with an auditable UTC timestamp."""
+    get_actions_connection().execute(
+        """
+        INSERT INTO analyst_actions(transaction_id, status, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(transaction_id) DO UPDATE SET
+            status = excluded.status,
+            updated_at = excluded.updated_at
+        """,
+        (transaction_id, status, datetime.now(timezone.utc).isoformat()),
+    )
+    get_actions_connection().commit()
+
+
+@st.cache_data(show_spinner="Recalculating dashboard risk scores...")
+def score_dashboard_data(df: pd.DataFrame, multiplier: float) -> pd.DataFrame:
+    """Recalculate rule decisions for the current IQR sensitivity setting."""
+    ml_columns = [column for column in ("ml_prediction", "ml_anomaly_score") if column in df]
+    scored, _ = evaluate_rules(
+        df.drop(columns=ml_columns, errors="ignore"),
+        iqr_multiplier=multiplier,
+    )
+    if ml_columns:
+        scored = scored.merge(df[["transaction_id", *ml_columns]], on="transaction_id", how="left")
+    return scored
+
+
+def run_read_only_query(conn: sqlite3.Connection, query: str) -> pd.DataFrame:
+    """Execute only one read-only SQL statement in the SQL lab."""
+    normalized = query.strip().upper()
+    if not normalized.startswith(("SELECT", "WITH")) or ";" in normalized.rstrip(";"):
+        raise ValueError("Only one read-only SELECT/WITH query is allowed.")
+    forbidden = (" INSERT ", " UPDATE ", " DELETE ", " DROP ", " ALTER ", " CREATE ", " ATTACH ", " DETACH ", " PRAGMA ")
+    padded = f" {normalized} "
+    if any(keyword in padded for keyword in forbidden):
+        raise ValueError("The SQL lab permits read-only queries only.")
+    return pd.read_sql_query(query, conn)
+
+
 @st.cache_data(show_spinner="Scoring your data with the risk engine...")
 def score_upload_cached(uploaded_df: pd.DataFrame, multiplier: float) -> tuple[pd.DataFrame, float]:
     """Cached wrapper so re-renders don't re-score an unchanged upload."""
@@ -146,11 +218,8 @@ if not DATA_FILE.exists():
     st.error("Missing enriched data file. Run `python src/generate_data.py` and `python src/analyze_data.py` first.")
     st.stop()
 
-# Initialize session state for analyst actions audit log
-if "analyst_actions" not in st.session_state:
-    st.session_state.analyst_actions = {}
-
 raw_df = load_transaction_data()
+analyst_actions = load_analyst_actions()
 
 # ----------------- SIDEBAR CONTROLS -----------------
 st.sidebar.image("https://img.icons8.com/color/96/shield.png", width=64)
@@ -196,30 +265,27 @@ q3 = raw_df["amount"].quantile(0.75)
 dynamic_iqr_limit = q3 + iqr_mult * (q3 - q1)
 st.sidebar.caption(f"Dynamic Upper Cutoff: **INR {dynamic_iqr_limit:,.2f}**")
 
-# Cutoff the shipped dataset was scored with (engine default 1.5x) — used for explainability details
-generated_iqr_limit = q3 + 1.5 * (q3 - q1)
+# Re-score the complete dataset so every dashboard view reflects the selected multiplier.
+scored_df = score_dashboard_data(raw_df, float(iqr_mult))
 
 # Apply Filters
 mask = (
-    (raw_df["upi_channel"].isin(selected_channels))
-    & (raw_df["merchant_category"].isin(selected_categories))
-    & (raw_df["location"].isin(selected_cities))
+    (scored_df["upi_channel"].isin(selected_channels))
+    & (scored_df["merchant_category"].isin(selected_categories))
+    & (scored_df["location"].isin(selected_cities))
 )
 if isinstance(selected_dates, (list, tuple)) and len(selected_dates) == 2:
     start_d, end_d = selected_dates
-    mask = mask & (raw_df["timestamp"].dt.date >= start_d) & (raw_df["timestamp"].dt.date <= end_d)
+    mask = mask & (scored_df["timestamp"].dt.date >= start_d) & (scored_df["timestamp"].dt.date <= end_d)
 
 if selected_risk_levels:
-    mask = mask & (raw_df["risk_level"].isin(selected_risk_levels))
+    mask = mask & (scored_df["risk_level"].isin(selected_risk_levels))
 
-filtered_df = raw_df[mask].copy()
+filtered_df = scored_df[mask].copy()
 
 if filtered_df.empty:
     st.warning("⚠️ No transactions match the selected filters. Please adjust your criteria in the sidebar.")
     st.stop()
-
-# Dynamic alert recalculation if user shifted IQR slider from default
-filtered_df["dynamic_amount_alert"] = (filtered_df["amount"] > dynamic_iqr_limit).astype(int)
 
 # ----------------- MAIN HEADER & KPI METRICS -----------------
 st.title("🛡️ UPI Transaction Risk & Fraud Analytics")
@@ -272,7 +338,7 @@ with tab_queue:
 
     # Add Action Status column from session state
     display_df["analyst_status"] = display_df["transaction_id"].map(
-        lambda tid: st.session_state.analyst_actions.get(tid, "Pending Review")
+        lambda tid: analyst_actions.get(tid, "Pending Review")
     )
 
     columns_to_render = [
@@ -322,24 +388,24 @@ with tab_queue:
             b1, b2, b3 = st.columns(3)
             with b1:
                 if st.button("✅ Approve", key="btn_app"):
-                    st.session_state.analyst_actions[selected_tx] = "Approved ✅"
+                    save_analyst_action(selected_tx, "Approved ✅")
                     st.success(f"{selected_tx} marked Approved!")
                     st.rerun()
             with b2:
                 if st.button("⚠️ Verify KYC", key="btn_ver"):
-                    st.session_state.analyst_actions[selected_tx] = "KYC Triggered ⚠️"
+                    save_analyst_action(selected_tx, "KYC Triggered ⚠️")
                     st.warning(f"Verification OTP sent for {selected_tx}")
                     st.rerun()
             with b3:
                 if st.button("🚫 Block Account", key="btn_blk"):
-                    st.session_state.analyst_actions[selected_tx] = "Blocked 🚫"
+                    save_analyst_action(selected_tx, "Blocked 🚫")
                     st.error(f"{selected_tx} sender frozen!")
                     st.rerun()
 
         # Per-transaction explainability: exactly why this score, rule by rule
         st.markdown("---")
         with st.expander(f"🧬 Explainability Breakdown — {selected_tx}", expanded=True):
-            render_explanation(tx_row, generated_iqr_limit)
+            render_explanation(tx_row, dynamic_iqr_limit)
 
 
 # ================= TAB 2: RISK ANALYTICS & PATTERNS =================
@@ -576,16 +642,26 @@ GROUP BY upi_channel
 ORDER BY incident_rate_pct DESC;
         """,
         "5. Sender Accounts with Rapid Consecutive Transactions": """
-SELECT 
+WITH ordered_transactions AS (
+    SELECT sender_id, timestamp, amount,
+        COUNT(*) OVER (
+            PARTITION BY sender_id
+            ORDER BY unixepoch(timestamp)
+            RANGE BETWEEN 900 PRECEDING AND CURRENT ROW
+        ) AS transactions_in_15m
+    FROM upi_transactions
+)
+SELECT
     sender_id,
-    COUNT(*) AS total_attempts,
-    ROUND(SUM(amount), 2) AS total_drained,
+    MAX(transactions_in_15m) AS peak_transactions_in_15m,
+    COUNT(*) AS triggering_transactions,
+    ROUND(SUM(amount), 2) AS triggering_amount,
     MIN(timestamp) AS first_txn,
     MAX(timestamp) AS last_txn
-FROM upi_transactions
+FROM ordered_transactions
+WHERE transactions_in_15m >= 3
 GROUP BY sender_id
-HAVING COUNT(*) >= 15
-ORDER BY total_attempts DESC
+ORDER BY peak_transactions_in_15m DESC, triggering_transactions DESC
 LIMIT 10;
         """,
     }
@@ -597,7 +673,7 @@ LIMIT 10;
 
     if st.button("▶️ Execute Query", key="btn_run_sql"):
         try:
-            sql_result = pd.read_sql_query(sql_text, conn)
+            sql_result = run_read_only_query(conn, sql_text)
             st.success(f"Query returned {len(sql_result):,} rows.")
             st.dataframe(sql_result, use_container_width=True)
         except Exception as e:

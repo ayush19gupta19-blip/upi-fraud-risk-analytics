@@ -10,9 +10,10 @@ A modern, production-grade financial risk analytics platform that combines **exp
 
 * **Multi-Factor Risk Scoring Engine:** Evaluates transactions across multiple behavioral dimensions and produces a composite 0–100 risk score and tiered risk categorization (`High`, `Medium`, `Low`).
 * **Unsupervised ML Benchmark:** Compares the deterministic, regulatory-friendly rule engine against an `IsolationForest` model to analyze precision, recall, and false-positive trade-offs.
-* **Interactive Triage Dashboard:** Built with Streamlit and Plotly, featuring live sensitivity tuning (dynamic IQR slider), triage workflow with session-based analyst decisions (`Approve`, `Verify KYC`, `Block`), and deep visual analytics.
+* **Interactive Triage Dashboard:** Built with Streamlit and Plotly, featuring live sensitivity tuning (dynamic IQR slider), persistent analyst decisions (`Approve`, `Verify KYC`, `Block`), and deep visual analytics.
 * **Embedded SQL Lab:** An in-memory SQLite analytics engine allowing live execution of business intelligence queries from `sql/analysis.sql`.
 * **Automated Test Coverage:** Comprehensive test suite covering data generator schema integrity, multi-pattern attack injections, rule evaluation, score bounds, and metric computation.
+* **Continuous Integration:** GitHub Actions installs dependencies, compiles the application, runs the full test suite, and checks whitespace on every push and pull request.
 
 ---
 
@@ -33,6 +34,7 @@ upi-fraud-risk-analytics/
 ├── tests/
 │   ├── test_generate_data.py      # Tests for data generator & schema validation
 │   └── test_analyze_data.py       # Tests for IQR fences, velocity rules & scoring bounds
+├── .github/workflows/ci.yml       # Automated test and compile checks
 ├── requirements.txt               # Dependencies: pandas, numpy, streamlit, scikit-learn, plotly
 └── README.md
 ```
@@ -100,9 +102,16 @@ The interactive dashboard includes a dedicated **ML vs. Rule Benchmark** tab com
 
 ## 📈 Dashboard Features
 
-1. **Operational Review Queue:** Searchable triage table with live analyst actions (`Approve`, `Verify KYC`, `Block`) updating in real-time.
-2. **Dynamic Sensitivity Slider:** Adjust the IQR multiplier ($1.0\times$ to $3.5\times$) live to visualize how threshold tuning impacts review queue volume.
+1. **Operational Review Queue:** Searchable triage table with persistent analyst actions (`Approve`, `Verify KYC`, `Block`) updating in real-time.
+2. **Dynamic Sensitivity Slider:** Adjust the IQR multiplier ($1.0\times$ to $3.5\times$) live to recalculate risk scores, tiers, reasons, and review queue volume consistently.
 3. **Risk Visualizations (Plotly):** Diurnal hourly risk curve, channel vulnerability breakdown, log-scale amount distributions per merchant category, and geographic risk distribution.
-4. **SQL Analytics Lab:** Run pre-built or custom queries directly against an in-memory SQLite database.
+4. **SQL Analytics Lab:** Run pre-built or custom read-only queries directly against an in-memory SQLite database.
 5. **Per-Transaction Explainability:** Select any transaction in the review queue to get a rule-by-rule breakdown of its composite score — which rules fired, exactly how many points each contributed, a plain-English audit detail for every flag, and how many points away it sits from the next risk tier.
 6. **Score Your Own CSV:** Upload any transaction CSV (`timestamp`, `amount`, `sender_id`, `receiver_id`, `upi_channel`) and have the same rule engine score it live with your current IQR sensitivity — including the optional Isolation Forest benchmark, an explainability drill-down, and a downloadable scored CSV.
+
+## Safety and validation notes
+
+* Uploaded files are validated for required columns, positive numeric amounts, parseable and timezone-consistent timestamps, duplicate transaction IDs, empty sender/receiver IDs, and supported UPI channels.
+* The SQL Lab executes one read-only `SELECT` or `WITH` statement at a time. Data-changing statements and multi-statement input are rejected.
+* Analyst actions are stored in the local SQLite file `data/analyst_actions.sqlite3`, which is excluded from version control.
+* Generated velocity-burst examples are constructed as explicit three-transaction windows so the synthetic benchmark matches the detector definition.

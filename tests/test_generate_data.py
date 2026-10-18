@@ -1,5 +1,6 @@
 import unittest
 from src.generate_data import generate_transactions
+from src.analyze_data import evaluate_rules
 
 
 class GenerateTransactionsTests(unittest.TestCase):
@@ -23,6 +24,16 @@ class GenerateTransactionsTests(unittest.TestCase):
         # Check anomaly types present
         anomaly_types = set(data["anomaly_type"].unique())
         self.assertTrue({"none", "high_value"}.issubset(anomaly_types))
+
+    def test_velocity_bursts_always_form_detectable_three_transaction_windows(self):
+        for seed in (0, 7, 42, 99):
+            data = generate_transactions(transaction_count=1_000, seed=seed)
+            scored, _ = evaluate_rules(data)
+            burst_rows = scored[scored["anomaly_type"] == "velocity_burst"]
+
+            self.assertGreater(len(burst_rows), 0, msg=f"seed={seed}")
+            max_window_counts = burst_rows.groupby("sender_id")["rolling_tx_count"].max()
+            self.assertTrue((max_window_counts >= 3).all(), msg=f"seed={seed}")
 
 
 if __name__ == "__main__":

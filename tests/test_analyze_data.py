@@ -7,6 +7,7 @@ from src.analyze_data import (
     evaluate_rules,
     calculate_metrics,
     explain_transaction,
+    train_isolation_forest,
     score_uploaded_transactions,
     validate_transaction_upload,
 )
@@ -175,6 +176,44 @@ class AnalyzeDataTests(unittest.TestCase):
         empty = sample_transactions().iloc[0:0]
         self.assertTrue(any("no transaction rows" in problem for problem in validate_transaction_upload(empty)))
 
+    def test_validate_transaction_upload_rejects_duplicate_and_empty_ids(self):
+        invalid = sample_transactions()
+        invalid.loc[1, "transaction_id"] = invalid.loc[0, "transaction_id"]
+        invalid.loc[2, "sender_id"] = "  "
+        invalid.loc[3, "receiver_id"] = pd.NA
+
+        problems = validate_transaction_upload(invalid)
+
+        self.assertTrue(any("transaction_id" in problem and "duplicate" in problem for problem in problems))
+        self.assertTrue(any("sender_id" in problem and "empty" in problem for problem in problems))
+        self.assertTrue(any("receiver_id" in problem and "empty" in problem for problem in problems))
+
+    def test_validate_transaction_upload_rejects_invalid_channels_and_mixed_timezones(self):
+        invalid = sample_transactions()
+        invalid.loc[0, "upi_channel"] = "Bank Transfer"
+        invalid["timestamp"] = invalid["timestamp"].astype(object)
+        invalid.loc[0, "timestamp"] = "2026-01-01T10:00:00+05:30"
+
+        problems = validate_transaction_upload(invalid)
+
+        self.assertTrue(any("upi_channel" in problem and "invalid" in problem for problem in problems))
+        self.assertTrue(any("timestamp" in problem and "timezone" in problem for problem in problems))
+
+    def test_score_uploaded_transactions_accepts_consistent_timezone(self):
+        aware = sample_transactions()
+        aware["timestamp"] = [
+            "2026-01-01T10:00:00+05:30",
+            "2026-01-01T04:32:00Z",
+            "2026-01-01T10:05:00+05:30",
+            "2026-01-01T21:30:00Z",
+            "2026-01-02T14:00:00+05:30",
+        ]
+
+        scored, _ = score_uploaded_transactions(aware, run_ml=False)
+
+        self.assertTrue(pd.api.types.is_datetime64_any_dtype(scored["timestamp"]))
+        self.assertIn("risk_score", scored.columns)
+
     def test_score_uploaded_transactions_runs_full_engine(self):
         scored, upper_limit = score_uploaded_transactions(sample_transactions())
 
@@ -198,6 +237,26 @@ class AnalyzeDataTests(unittest.TestCase):
 
         self.assertNotIn("ml_prediction", scored.columns)
         self.assertIn("risk_score", scored.columns)  # rule engine still runs
+
+    def test_score_uploaded_transactions_can_configure_or_skip_ml(self):
+        scored, _ = score_uploaded_transactions(
+            sample_transactions(),
+            run_ml=True,
+            contamination=0.2,
+            seed=7,
+            n_estimators=8,
+        )
+        self.assertIn("ml_prediction", scored.columns)
+        self.assertIn("ml_anomaly_score", scored.columns)
+
+        rules_only, _ = score_uploaded_transactions(sample_transactions(), run_ml=False)
+        self.assertNotIn("ml_prediction", rules_only.columns)
+
+    def test_train_isolation_forest_rejects_invalid_estimator_count(self):
+        scored, _ = evaluate_rules(sample_transactions())
+
+        with self.assertRaises(ValueError):
+            train_isolation_forest(scored, n_estimators=0)
 
     def test_score_uploaded_transactions_rejects_invalid_upload(self):
         with self.assertRaises(ValueError) as ctx:
