@@ -1,4 +1,7 @@
 import unittest
+
+import load_path  # noqa: F401
+
 import pandas as pd
 from src.analyze_data import (
     RULE_WEIGHTS,

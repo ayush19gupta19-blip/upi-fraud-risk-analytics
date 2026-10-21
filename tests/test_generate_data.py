@@ -1,4 +1,7 @@
 import unittest
+
+import load_path  # noqa: F401
+
 from src.generate_data import generate_transactions
 
 
@@ -20,9 +23,12 @@ class GenerateTransactionsTests(unittest.TestCase):
         self.assertGreater(len(high_values), 0)
         self.assertTrue((high_values >= 15_000).all())
 
-        # Check anomaly types present
         anomaly_types = set(data["anomaly_type"].unique())
-        self.assertTrue({"none", "high_value"}.issubset(anomaly_types))
+        self.assertIn("none", anomaly_types)
+        self.assertIn("high_value", anomaly_types)
+        self.assertIn("velocity_burst", anomaly_types)
+        self.assertIn("collect_scam", anomaly_types)
+        self.assertIn("odd_hour", anomaly_types)
 
 
 if __name__ == "__main__":

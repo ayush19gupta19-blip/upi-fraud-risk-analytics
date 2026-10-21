@@ -1,108 +1,87 @@
-# 🛡️ UPI Transaction Risk & Fraud Analytics
+# UPI Transaction Risk & Fraud Analytics
 
-A modern, production-grade financial risk analytics platform that combines **explainable multi-factor heuristics** (Tukey's IQR Outlier Detection, Rolling Velocity Checks, Odd-Hours Flags, and Collect-Request Scams) with an **unsupervised Machine Learning benchmark** (Isolation Forest) on synthetic UPI payments.
+Synthetic UPI payment data, a rule-based risk scorer, an Isolation Forest benchmark, and a Streamlit dashboard for triage and exploration.
 
-> **Disclaimer:** Every transaction in this project is synthetic and generated for demonstration and research purposes. It simulates real-world payment risk dynamics and compliance review operations.
+All transactions are generated for demo and learning — not real customer data.
 
----
-
-## ⚡ Key Highlights
-
-* **Multi-Factor Risk Scoring Engine:** Evaluates transactions across multiple behavioral dimensions and produces a composite 0–100 risk score and tiered risk categorization (`High`, `Medium`, `Low`).
-* **Unsupervised ML Benchmark:** Compares the deterministic, regulatory-friendly rule engine against an `IsolationForest` model to analyze precision, recall, and false-positive trade-offs.
-* **Interactive Triage Dashboard:** Built with Streamlit and Plotly, featuring live sensitivity tuning (dynamic IQR slider), triage workflow with session-based analyst decisions (`Approve`, `Verify KYC`, `Block`), and deep visual analytics.
-* **Embedded SQL Lab:** An in-memory SQLite analytics engine allowing live execution of business intelligence queries from `sql/analysis.sql`.
-* **Automated Test Coverage:** Comprehensive test suite covering data generator schema integrity, multi-pattern attack injections, rule evaluation, score bounds, and metric computation.
-
----
-
-## 🏗️ Architecture & Component Overview
+## What's in the repo
 
 ```
 upi-fraud-risk-analytics/
-├── app/
-│   └── dashboard.py               # Streamlit interactive operations & analytics workstation
-├── data/
-│   ├── upi_transactions.csv       # Raw synthetic dataset (10,000 transactions)
-│   └── transactions_with_iqr_flags.csv  # Enriched dataset with rules, composite scores & ML predictions
-├── sql/
-│   └── analysis.sql               # SQLite business analytics & risk intelligence queries
+├── app/dashboard.py          # Streamlit UI
+├── data/                     # CSV inputs and scored outputs
+├── sql/analysis.sql          # Shared SQL templates (also used by the dashboard)
 ├── src/
-│   ├── generate_data.py           # Diurnal cycle modeling & multi-pattern attack injection
-│   └── analyze_data.py            # Multi-factor scoring engine & Isolation Forest benchmark
+│   ├── generate_data.py      # Synthetic data + injected fraud patterns
+│   ├── analyze_data.py       # Scoring engine + ML benchmark
+│   └── sql_queries.py        # Parser for analysis.sql
 ├── tests/
-│   ├── test_generate_data.py      # Tests for data generator & schema validation
-│   └── test_analyze_data.py       # Tests for IQR fences, velocity rules & scoring bounds
-├── requirements.txt               # Dependencies: pandas, numpy, streamlit, scikit-learn, plotly
-└── README.md
+└── requirements.txt
 ```
 
----
+## Setup
 
-## 🚀 Quickstart
-
-### 1. Install Dependencies
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 2. Generate Synthetic UPI Dataset
-Models realistic diurnal payment patterns (midday/evening volume peaks vs. night troughs) and injects multi-pattern fraud typologies:
+Generate data:
+
 ```powershell
 python src/generate_data.py
 ```
 
-### 3. Run Risk Scoring & ML Anomaly Detection
-Computes the dynamic IQR cutoff, evaluates rolling velocity spikes, odd-hour transactions, collect scams, and fits the Isolation Forest model:
+Score offline and write `data/transactions_with_iqr_flags.csv` (optional if you only use the dashboard):
+
 ```powershell
 python src/analyze_data.py
 ```
 
-### 4. Launch the Interactive Dashboard
+Run the dashboard:
+
 ```powershell
 streamlit run app/dashboard.py
 ```
 
-### 5. Run Automated Tests
+The app reads `data/upi_transactions.csv` and **re-scores on load**. Moving the IQR multiplier in the sidebar updates risk scores, the review queue, charts, and explainability — no need to re-run `analyze_data.py` for that.
+
+Tests:
+
 ```powershell
-python -m unittest discover tests
+python -m unittest discover -s tests -v
 ```
 
----
+CI runs the same unittest command on push (see `.github/workflows/tests.yml`).
 
-## 🧠 Risk Detection Heuristics
+## Risk rules
 
-| Rule | Detection Methodology | Weight | Rationale |
-| :--- | :--- | :--- | :--- |
-| **Amount IQR Alert** | Amount exceeds $Q3 + 1.5 \times \text{IQR}$ | 40 pts | Catches extreme monetary anomalies outside normal retail spend. |
-| **Rolling Velocity Spike** | $\ge 3$ transactions by the same sender in $< 15$ minutes | 30 pts | Identifies rapid account draining or brute-force card/UPI abuse. |
-| **Collect Request Scam** | Amount $\ge \text{₹5,000}$ via `Collect Request` channel | 20 pts | Detects the common "click approve to receive cashback" phishing scam. |
-| **Odd-Hours Payment** | Payment between 01:00 AM and 05:00 AM with elevated value | 10 pts | Flags off-hours transactions that deviate from the sender's normal circadian pattern. |
+| Rule | Condition | Points |
+|------|-----------|--------|
+| Amount IQR | Amount above Tukey upper fence (Q3 + k×IQR) | 40 |
+| Velocity | ≥3 txns by same sender within 15 minutes | 30 |
+| Collect request | Collect Request and amount ≥ ₹5,000 | 20 |
+| Odd hours | 01:00–05:00 and amount > ₹1,500 | 10 |
 
-* **Composite Risk Score (0 - 100):** Sum of triggered rule points.
-* **Risk Tiers:**
-  * **High Risk (60 - 100 pts):** Immediate review / block recommended.
-  * **Medium Risk (30 - 59 pts):** Automated step-up authentication (OTP/KYC).
-  * **Low Risk (0 - 29 pts):** Straight-through processing.
+Composite score is the sum of triggered rules (capped at 100).
 
----
+| Tier | Score |
+|------|-------|
+| Low | 0–29 |
+| Medium | 30–59 |
+| High | 60–100 |
 
-## 📊 Heuristics vs. Machine Learning Benchmark
+Review queue: score ≥ 30 (`in_review_queue`).
 
-In financial fraud operations, **explainability** is a critical regulatory mandate:
+## Rules vs Isolation Forest
 
-* **Rule-Based Engine:** Provides **100% deterministic audit trails** with exact human-readable reasons (e.g., *"Amount > INR 1,172 (IQR); Velocity spike (3 txns in 15m)"*).
-* **Isolation Forest:** Effectively flags multi-dimensional outliers without manually configured thresholds, but acts as a black box requiring post-hoc explainers (such as SHAP) for regulatory compliance.
+The rule engine is fully explainable — every alert has a fixed reason string. Isolation Forest adds a second pass on amount, time, velocity, channel, device, and category frequency. The dashboard compares precision/recall against the synthetic `risk_flag` column from data generation.
 
-The interactive dashboard includes a dedicated **ML vs. Rule Benchmark** tab comparing precision, recall, and detection overlap between both paradigms.
+## Dashboard tabs
 
----
+1. **Review queue** — filter, search, analyst actions (approve / KYC / block), per-transaction rule breakdown.
+2. **Analytics** — hourly traffic, channels, amount distribution (IQR line matches the sidebar), cities.
+3. **ML benchmark** — rules vs Isolation Forest on the current scored dataset.
+4. **SQL lab** — queries from `sql/analysis.sql`, plus a free-form editor against an in-memory SQLite copy of the scored data.
+5. **Upload CSV** — same scorer as the main dataset; uses the sidebar IQR multiplier. Include `merchant_category` and `device_type` to enable the ML columns.
 
-## 📈 Dashboard Features
-
-1. **Operational Review Queue:** Searchable triage table with live analyst actions (`Approve`, `Verify KYC`, `Block`) updating in real-time.
-2. **Dynamic Sensitivity Slider:** Adjust the IQR multiplier ($1.0\times$ to $3.5\times$) live to visualize how threshold tuning impacts review queue volume.
-3. **Risk Visualizations (Plotly):** Diurnal hourly risk curve, channel vulnerability breakdown, log-scale amount distributions per merchant category, and geographic risk distribution.
-4. **SQL Analytics Lab:** Run pre-built or custom queries directly against an in-memory SQLite database.
-5. **Per-Transaction Explainability:** Select any transaction in the review queue to get a rule-by-rule breakdown of its composite score — which rules fired, exactly how many points each contributed, a plain-English audit detail for every flag, and how many points away it sits from the next risk tier.
-6. **Score Your Own CSV:** Upload any transaction CSV (`timestamp`, `amount`, `sender_id`, `receiver_id`, `upi_channel`) and have the same rule engine score it live with your current IQR sensitivity — including the optional Isolation Forest benchmark, an explainability drill-down, and a downloadable scored CSV.
+Required upload columns: `timestamp`, `amount`, `sender_id`, `receiver_id`, `upi_channel`.

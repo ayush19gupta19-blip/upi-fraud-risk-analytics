@@ -76,24 +76,37 @@ def generate_transactions(transaction_count: int = 10_000, seed: int = 42) -> pd
     transactions.loc[high_value_indices, "anomaly_type"] = "high_value"
     transactions.loc[high_value_indices, "risk_flag"] = 1
 
-    # 2. Injected Velocity Bursts (~0.6% burst events: same sender draining account in rapid succession)
+    # 2. Injected Velocity Bursts (~0.2% burst events: same sender draining account in rapid succession)
     velocity_event_count = max(1, round(transaction_count * 0.002))
-    available_indices = transactions[transactions["risk_flag"] == 0].index
-    burst_start_indices = random.choice(available_indices, size=velocity_event_count, replace=False)
+    sender_counts = transactions.groupby("sender_id").size()
+    eligible_senders = sender_counts[sender_counts >= 3].index.to_numpy()
 
-    for idx in burst_start_indices:
-        sender = transactions.at[idx, "sender_id"]
-        base_ts = transactions.at[idx, "timestamp"]
-        # Create 2 additional rapid payments for this sender within 3-8 minutes
-        other_indices = transactions[(transactions["sender_id"] == sender) & (transactions.index != idx)].index
-        if len(other_indices) >= 2:
-            burst_sub = other_indices[:2]
-            for step, sub_idx in enumerate(burst_sub, start=1):
-                transactions.at[sub_idx, "timestamp"] = base_ts + pd.Timedelta(minutes=step * 2 + int(random.integers(1, 3)))
-                transactions.at[sub_idx, "anomaly_type"] = "velocity_burst"
-                transactions.at[sub_idx, "risk_flag"] = 1
-            transactions.at[idx, "anomaly_type"] = "velocity_burst"
-            transactions.at[idx, "risk_flag"] = 1
+    bursts_applied = 0
+    max_attempts = max(velocity_event_count * 25, 50)
+    for _ in range(max_attempts):
+        if bursts_applied >= velocity_event_count or len(eligible_senders) == 0:
+            break
+
+        sender = random.choice(eligible_senders)
+        sender_indices = transactions.index[
+            (transactions["sender_id"] == sender) & (transactions["risk_flag"] == 0)
+        ].to_numpy()
+        if len(sender_indices) < 3:
+            continue
+
+        burst_indices = random.choice(sender_indices, size=3, replace=False)
+        base_ts = transactions.at[burst_indices[0], "timestamp"]
+        transactions.at[burst_indices[0], "anomaly_type"] = "velocity_burst"
+        transactions.at[burst_indices[0], "risk_flag"] = 1
+
+        for step, sub_idx in enumerate(burst_indices[1:], start=1):
+            transactions.at[sub_idx, "timestamp"] = base_ts + pd.Timedelta(
+                minutes=step * 2 + int(random.integers(1, 3))
+            )
+            transactions.at[sub_idx, "anomaly_type"] = "velocity_burst"
+            transactions.at[sub_idx, "risk_flag"] = 1
+
+        bursts_applied += 1
 
     # 3. Injected Collect-Request Phishing Scams (~0.6% high amounts via Collect Request)
     collect_candidates = transactions[(transactions["risk_flag"] == 0) & (transactions["upi_channel"] == "Collect Request")].index

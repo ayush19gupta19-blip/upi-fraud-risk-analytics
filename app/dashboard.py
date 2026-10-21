@@ -10,14 +10,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DATA_FILE = PROJECT_ROOT / "data" / "transactions_with_iqr_flags.csv"
 RAW_DATA_FILE = PROJECT_ROOT / "data" / "upi_transactions.csv"
+SQL_QUERIES_FILE = PROJECT_ROOT / "sql" / "analysis.sql"
 
 # Make the repo root importable so the scoring engine can be reused directly
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.analyze_data import explain_transaction, score_uploaded_transactions, validate_transaction_upload
+from src.sql_queries import load_named_queries
 
 st.set_page_config(
     page_title="UPI Risk Guardian - Fraud Analytics",
@@ -68,17 +69,21 @@ st.markdown(
 
 
 @st.cache_data
-def load_transaction_data() -> pd.DataFrame:
-    """Load enriched transaction dataset with cached execution."""
-    df = pd.read_csv(DATA_FILE, parse_dates=["timestamp"])
-    return df
+def load_raw_transactions(data_mtime: float) -> pd.DataFrame:
+    """Load the synthetic transaction CSV (cache busts when the file is regenerated)."""
+    return pd.read_csv(RAW_DATA_FILE, parse_dates=["timestamp"])
 
 
-@st.cache_resource
-def get_sqlite_connection(df: pd.DataFrame) -> sqlite3.Connection:
-    """Create an in-memory SQLite database populated with transaction records."""
+@st.cache_data(show_spinner="Scoring transactions with current rule settings...")
+def load_scored_transactions(iqr_multiplier: float, data_mtime: float) -> tuple[pd.DataFrame, float]:
+    """Run the full rule engine + optional ML benchmark for the dashboard dataset."""
+    raw = load_raw_transactions(data_mtime)
+    return score_uploaded_transactions(raw, iqr_multiplier=iqr_multiplier)
+
+
+def sqlite_connection_from_frame(df: pd.DataFrame) -> sqlite3.Connection:
+    """In-memory SQLite DB for the SQL lab (rebuilt when scores or filters change)."""
     conn = sqlite3.connect(":memory:", check_same_thread=False)
-    # Convert timestamp to string for sqlite compatibility
     df_sql = df.copy()
     df_sql["timestamp"] = df_sql["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
     df_sql.to_sql("upi_transactions", conn, if_exists="replace", index=False)
@@ -142,84 +147,68 @@ def render_explanation(row: pd.Series, iqr_upper_limit: float) -> None:
         )
 
 
-if not DATA_FILE.exists():
-    st.error("Missing enriched data file. Run `python src/generate_data.py` and `python src/analyze_data.py` first.")
+if not RAW_DATA_FILE.exists():
+    st.error("Missing `data/upi_transactions.csv`. Run `python src/generate_data.py` first.")
     st.stop()
 
-# Initialize session state for analyst actions audit log
 if "analyst_actions" not in st.session_state:
     st.session_state.analyst_actions = {}
 
-raw_df = load_transaction_data()
+data_mtime = RAW_DATA_FILE.stat().st_mtime
 
 # ----------------- SIDEBAR CONTROLS -----------------
-st.sidebar.image("https://img.icons8.com/color/96/shield.png", width=64)
-st.sidebar.title("Filter & Tuning Controls")
+st.sidebar.title("Filters & tuning")
 
-# Date Filter
-min_date = raw_df["timestamp"].dt.date.min()
-max_date = raw_df["timestamp"].dt.date.max()
-selected_dates = st.sidebar.date_input("Date Range", [min_date, max_date], min_value=min_date, max_value=max_date)
-
-# Risk Level Filter
-available_risk_levels = ["High", "Medium", "Low"]
-selected_risk_levels = st.sidebar.multiselect(
-    "Risk Tiers", options=available_risk_levels, default=["High", "Medium"]
-)
-
-# UPI Channel Filter
-available_channels = list(raw_df["upi_channel"].unique())
-selected_channels = st.sidebar.multiselect("UPI Channel", options=available_channels, default=available_channels)
-
-# Merchant Category Filter
-available_categories = list(raw_df["merchant_category"].unique())
-selected_categories = st.sidebar.multiselect("Merchant Category", options=available_categories, default=available_categories)
-
-# City Filter
-available_cities = list(raw_df["location"].unique())
-selected_cities = st.sidebar.multiselect("Cities", options=available_cities, default=available_cities)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("⚙️ Live IQR Sensitivity Tuning")
+st.sidebar.subheader("IQR sensitivity")
 iqr_mult = st.sidebar.slider(
-    "IQR Multiplier (Fence Sensitivity)",
+    "IQR multiplier",
     min_value=1.0,
     max_value=3.5,
     value=1.5,
     step=0.25,
-    help="Default is 1.5x (standard Tukey's fence). Lower values increase review queue size (higher sensitivity).",
+    help="Tukey fence multiplier. Lower values pull more payments into the review queue.",
 )
 
-# Recalculate dynamic upper limit based on slider
-q1 = raw_df["amount"].quantile(0.25)
-q3 = raw_df["amount"].quantile(0.75)
-dynamic_iqr_limit = q3 + iqr_mult * (q3 - q1)
-st.sidebar.caption(f"Dynamic Upper Cutoff: **INR {dynamic_iqr_limit:,.2f}**")
+scored_df, iqr_upper_limit = load_scored_transactions(float(iqr_mult), data_mtime)
+st.sidebar.caption(f"Amount IQR cutoff: **INR {iqr_upper_limit:,.2f}**")
 
-# Cutoff the shipped dataset was scored with (engine default 1.5x) — used for explainability details
-generated_iqr_limit = q3 + 1.5 * (q3 - q1)
+min_date = scored_df["timestamp"].dt.date.min()
+max_date = scored_df["timestamp"].dt.date.max()
+selected_dates = st.sidebar.date_input("Date range", [min_date, max_date], min_value=min_date, max_value=max_date)
 
-# Apply Filters
+available_risk_levels = ["High", "Medium", "Low"]
+selected_risk_levels = st.sidebar.multiselect(
+    "Risk tiers", options=available_risk_levels, default=["High", "Medium"]
+)
+
+available_channels = list(scored_df["upi_channel"].unique())
+selected_channels = st.sidebar.multiselect("UPI channel", options=available_channels, default=available_channels)
+
+available_categories = list(scored_df["merchant_category"].unique())
+selected_categories = st.sidebar.multiselect(
+    "Merchant category", options=available_categories, default=available_categories
+)
+
+available_cities = list(scored_df["location"].unique())
+selected_cities = st.sidebar.multiselect("Cities", options=available_cities, default=available_cities)
+
 mask = (
-    (raw_df["upi_channel"].isin(selected_channels))
-    & (raw_df["merchant_category"].isin(selected_categories))
-    & (raw_df["location"].isin(selected_cities))
+    (scored_df["upi_channel"].isin(selected_channels))
+    & (scored_df["merchant_category"].isin(selected_categories))
+    & (scored_df["location"].isin(selected_cities))
 )
 if isinstance(selected_dates, (list, tuple)) and len(selected_dates) == 2:
     start_d, end_d = selected_dates
-    mask = mask & (raw_df["timestamp"].dt.date >= start_d) & (raw_df["timestamp"].dt.date <= end_d)
+    mask = mask & (scored_df["timestamp"].dt.date >= start_d) & (scored_df["timestamp"].dt.date <= end_d)
 
 if selected_risk_levels:
-    mask = mask & (raw_df["risk_level"].isin(selected_risk_levels))
+    mask = mask & (scored_df["risk_level"].isin(selected_risk_levels))
 
-filtered_df = raw_df[mask].copy()
+filtered_df = scored_df[mask].copy()
 
 if filtered_df.empty:
-    st.warning("⚠️ No transactions match the selected filters. Please adjust your criteria in the sidebar.")
+    st.warning("No transactions match the selected filters. Adjust the sidebar filters.")
     st.stop()
-
-# Dynamic alert recalculation if user shifted IQR slider from default
-filtered_df["dynamic_amount_alert"] = (filtered_df["amount"] > dynamic_iqr_limit).astype(int)
 
 # ----------------- MAIN HEADER & KPI METRICS -----------------
 st.title("🛡️ UPI Transaction Risk & Fraud Analytics")
@@ -339,7 +328,7 @@ with tab_queue:
         # Per-transaction explainability: exactly why this score, rule by rule
         st.markdown("---")
         with st.expander(f"🧬 Explainability Breakdown — {selected_tx}", expanded=True):
-            render_explanation(tx_row, generated_iqr_limit)
+            render_explanation(tx_row, iqr_upper_limit)
 
 
 # ================= TAB 2: RISK ANALYTICS & PATTERNS =================
@@ -425,10 +414,10 @@ with tab_analytics:
             title="Log Scale Amount Spread per Merchant Category",
         )
         fig_box.add_hline(
-            y=dynamic_iqr_limit,
+            y=iqr_upper_limit,
             line_dash="dash",
             line_color="red",
-            annotation_text=f"IQR Cutoff: INR {dynamic_iqr_limit:,.0f}",
+            annotation_text=f"IQR cutoff: INR {iqr_upper_limit:,.0f}",
         )
         fig_box.update_layout(showlegend=False, margin=dict(l=20, r=20, t=40, b=20), height=330)
         st.plotly_chart(fig_box, use_container_width=True)
@@ -529,73 +518,28 @@ with tab_ml_benchmark:
 # ================= TAB 4: SQL LAB =================
 with tab_sql:
     st.subheader("SQL Analytics Lab (SQLite Engine)")
-    st.caption("Directly test and run SQL queries against the active dataset.")
+    st.caption(
+        f"Pre-built queries are loaded from `{SQL_QUERIES_FILE.relative_to(PROJECT_ROOT).as_posix()}`. "
+        "The in-memory database reflects the full scored dataset at your current IQR setting."
+    )
 
-    conn = get_sqlite_connection(raw_df)
+    conn = sqlite_connection_from_frame(scored_df)
 
-    queries = {
-        "1. Merchant Category Volume & Total Spend": """
-SELECT 
-    merchant_category, 
-    COUNT(*) AS total_transactions, 
-    ROUND(SUM(amount), 2) AS total_amount,
-    ROUND(AVG(amount), 2) AS avg_ticket_size
-FROM upi_transactions
-GROUP BY merchant_category
-ORDER BY total_amount DESC;
-        """,
-        "2. Hourly UPI Traffic & Diurnal Cycle Breakdown": """
-SELECT 
-    strftime('%H', timestamp) AS hour_of_day, 
-    COUNT(*) AS transaction_count,
-    ROUND(AVG(amount), 2) AS avg_amount,
-    SUM(CASE WHEN risk_flag = 1 THEN 1 ELSE 0 END) AS risk_flagged_count
-FROM upi_transactions
-GROUP BY hour_of_day
-ORDER BY hour_of_day ASC;
-        """,
-        "3. High-Risk Payments by City": """
-SELECT 
-    location, 
-    COUNT(*) AS total_txns,
-    SUM(CASE WHEN risk_flag = 1 THEN 1 ELSE 0 END) AS high_risk_txns,
-    ROUND(100.0 * SUM(CASE WHEN risk_flag = 1 THEN 1 ELSE 0 END) / COUNT(*), 2) AS risk_percentage
-FROM upi_transactions
-GROUP BY location
-ORDER BY high_risk_txns DESC;
-        """,
-        "4. Channel Vulnerability Breakdown": """
-SELECT 
-    upi_channel,
-    COUNT(*) AS transaction_count,
-    ROUND(SUM(amount), 2) AS total_volume,
-    SUM(CASE WHEN risk_flag = 1 THEN 1 ELSE 0 END) AS flagged_count,
-    ROUND(100.0 * SUM(CASE WHEN risk_flag = 1 THEN 1 ELSE 0 END) / COUNT(*), 2) AS incident_rate_pct
-FROM upi_transactions
-GROUP BY upi_channel
-ORDER BY incident_rate_pct DESC;
-        """,
-        "5. Sender Accounts with Rapid Consecutive Transactions": """
-SELECT 
-    sender_id,
-    COUNT(*) AS total_attempts,
-    ROUND(SUM(amount), 2) AS total_drained,
-    MIN(timestamp) AS first_txn,
-    MAX(timestamp) AS last_txn
-FROM upi_transactions
-GROUP BY sender_id
-HAVING COUNT(*) >= 15
-ORDER BY total_attempts DESC
-LIMIT 10;
-        """,
-    }
+    try:
+        queries = load_named_queries(SQL_QUERIES_FILE)
+    except (OSError, ValueError) as exc:
+        st.error(f"Could not load SQL templates: {exc}")
+        queries = {}
 
-    selected_query_name = st.selectbox("Select Pre-configured SQL Query", options=list(queries.keys()))
+    if not queries:
+        st.stop()
+
+    selected_query_name = st.selectbox("Pre-built query", options=list(queries.keys()))
     default_sql = queries[selected_query_name].strip()
 
-    sql_text = st.text_area("SQL Editor", value=default_sql, height=140)
+    sql_text = st.text_area("SQL editor", value=default_sql, height=140)
 
-    if st.button("▶️ Execute Query", key="btn_run_sql"):
+    if st.button("Run query", key="btn_run_sql"):
         try:
             sql_result = pd.read_sql_query(sql_text, conn)
             st.success(f"Query returned {len(sql_result):,} rows.")
