@@ -12,8 +12,11 @@ class SqlQueriesTests(unittest.TestCase):
         queries = load_named_queries(sql_path)
 
         self.assertEqual(len(queries), 5)
-        self.assertTrue(all(stmt.upper().startswith("SELECT") for stmt in queries.values()))
+        self.assertTrue(
+            all(stmt.lstrip().upper().startswith(("SELECT", "WITH")) for stmt in queries.values())
+        )
         self.assertIn("1. Merchant Category Volume & Total Spend", queries)
+        self.assertTrue(any("Velocity" in title for title in queries))
 
 
 if __name__ == "__main__":

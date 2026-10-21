@@ -43,14 +43,30 @@ GROUP BY upi_channel
 ORDER BY incident_rate_pct DESC;
 
 -- 5. Sender Accounts with Rapid Consecutive Transactions (Velocity Outliers)
+-- SQLite window functions identify senders with at least three transactions
+-- inside a rolling 15-minute window instead of only counting daily volume.
+WITH ordered_transactions AS (
+    SELECT
+        sender_id,
+        transaction_id,
+        timestamp,
+        amount,
+        COUNT(*) OVER (
+            PARTITION BY sender_id
+            ORDER BY unixepoch(timestamp)
+            RANGE BETWEEN 900 PRECEDING AND CURRENT ROW
+        ) AS transactions_in_15m
+    FROM upi_transactions
+)
 SELECT 
     sender_id,
-    COUNT(*) AS total_attempts,
-    ROUND(SUM(amount), 2) AS total_drained,
+    MAX(transactions_in_15m) AS peak_transactions_in_15m,
+    COUNT(*) AS triggering_transactions,
+    ROUND(SUM(amount), 2) AS triggering_amount,
     MIN(timestamp) AS first_txn,
     MAX(timestamp) AS last_txn
-FROM upi_transactions
+FROM ordered_transactions
+WHERE transactions_in_15m >= 3
 GROUP BY sender_id
-HAVING COUNT(*) >= 15
-ORDER BY total_attempts DESC
+ORDER BY peak_transactions_in_15m DESC, triggering_transactions DESC
 LIMIT 10;

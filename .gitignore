@@ -3,4 +3,4 @@ __pycache__/
 .venv/
 .streamlit/
 .pytest_cache/
-
+data/analyst_actions.sqlite3

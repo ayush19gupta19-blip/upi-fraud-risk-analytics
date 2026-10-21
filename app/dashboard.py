@@ -3,6 +3,7 @@
 from pathlib import Path
 import sqlite3
 import sys
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -10,6 +11,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_FILE = PROJECT_ROOT / "data" / "transactions_with_iqr_flags.csv"
 RAW_DATA_FILE = PROJECT_ROOT / "data" / "upi_transactions.csv"
 SQL_QUERIES_FILE = PROJECT_ROOT / "sql" / "analysis.sql"
 
@@ -17,7 +19,12 @@ SQL_QUERIES_FILE = PROJECT_ROOT / "sql" / "analysis.sql"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.analyze_data import explain_transaction, score_uploaded_transactions, validate_transaction_upload
+from src.analyze_data import (
+    evaluate_rules,
+    explain_transaction,
+    score_uploaded_transactions,
+    validate_transaction_upload,
+)
 from src.sql_queries import load_named_queries
 
 st.set_page_config(
@@ -69,25 +76,86 @@ st.markdown(
 
 
 @st.cache_data
-def load_raw_transactions(data_mtime: float) -> pd.DataFrame:
-    """Load the synthetic transaction CSV (cache busts when the file is regenerated)."""
-    return pd.read_csv(RAW_DATA_FILE, parse_dates=["timestamp"])
+def load_transaction_data(data_mtime: float) -> pd.DataFrame:
+    """Load enriched transaction dataset; cache refreshes when the CSV is regenerated."""
+    return pd.read_csv(DATA_FILE, parse_dates=["timestamp"])
 
 
-@st.cache_data(show_spinner="Scoring transactions with current rule settings...")
-def load_scored_transactions(iqr_multiplier: float, data_mtime: float) -> tuple[pd.DataFrame, float]:
-    """Run the full rule engine + optional ML benchmark for the dashboard dataset."""
-    raw = load_raw_transactions(data_mtime)
-    return score_uploaded_transactions(raw, iqr_multiplier=iqr_multiplier)
-
-
-def sqlite_connection_from_frame(df: pd.DataFrame) -> sqlite3.Connection:
-    """In-memory SQLite DB for the SQL lab (rebuilt when scores or filters change)."""
+@st.cache_resource
+def get_sqlite_connection(df: pd.DataFrame) -> sqlite3.Connection:
+    """Create an in-memory SQLite database populated with transaction records."""
     conn = sqlite3.connect(":memory:", check_same_thread=False)
+    # Convert timestamp to string for sqlite compatibility
     df_sql = df.copy()
     df_sql["timestamp"] = df_sql["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
     df_sql.to_sql("upi_transactions", conn, if_exists="replace", index=False)
     return conn
+
+
+@st.cache_resource
+def get_actions_connection() -> sqlite3.Connection:
+    """Open the local analyst-decision store and create its schema."""
+    db_path = PROJECT_ROOT / "data" / "analyst_actions.sqlite3"
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analyst_actions (
+            transaction_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def load_analyst_actions() -> dict[str, str]:
+    """Load persisted decisions for display in the review queue."""
+    rows = get_actions_connection().execute(
+        "SELECT transaction_id, status FROM analyst_actions"
+    ).fetchall()
+    return {transaction_id: status for transaction_id, status in rows}
+
+
+def save_analyst_action(transaction_id: str, status: str) -> None:
+    """Persist one analyst decision with an auditable UTC timestamp."""
+    get_actions_connection().execute(
+        """
+        INSERT INTO analyst_actions(transaction_id, status, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(transaction_id) DO UPDATE SET
+            status = excluded.status,
+            updated_at = excluded.updated_at
+        """,
+        (transaction_id, status, datetime.now(timezone.utc).isoformat()),
+    )
+    get_actions_connection().commit()
+
+
+@st.cache_data(show_spinner="Recalculating dashboard risk scores...")
+def score_dashboard_data(df: pd.DataFrame, multiplier: float) -> tuple[pd.DataFrame, float]:
+    """Recalculate rule decisions for the current IQR sensitivity setting."""
+    ml_columns = [column for column in ("ml_prediction", "ml_anomaly_score") if column in df]
+    scored, upper_limit = evaluate_rules(
+        df.drop(columns=ml_columns, errors="ignore"),
+        iqr_multiplier=multiplier,
+    )
+    if ml_columns:
+        scored = scored.merge(df[["transaction_id", *ml_columns]], on="transaction_id", how="left")
+    return scored, upper_limit
+
+
+def run_read_only_query(conn: sqlite3.Connection, query: str) -> pd.DataFrame:
+    """Execute only one read-only SQL statement in the SQL lab."""
+    normalized = query.strip().upper()
+    if not normalized.startswith(("SELECT", "WITH")) or ";" in normalized.rstrip(";"):
+        raise ValueError("Only one read-only SELECT/WITH query is allowed.")
+    forbidden = (" INSERT ", " UPDATE ", " DELETE ", " DROP ", " ALTER ", " CREATE ", " ATTACH ", " DETACH ", " PRAGMA ")
+    padded = f" {normalized} "
+    if any(keyword in padded for keyword in forbidden):
+        raise ValueError("The SQL lab permits read-only queries only.")
+    return pd.read_sql_query(query, conn)
 
 
 @st.cache_data(show_spinner="Scoring your data with the risk engine...")
@@ -147,51 +215,55 @@ def render_explanation(row: pd.Series, iqr_upper_limit: float) -> None:
         )
 
 
-if not RAW_DATA_FILE.exists():
-    st.error("Missing `data/upi_transactions.csv`. Run `python src/generate_data.py` first.")
+if not DATA_FILE.exists():
+    st.error("Missing enriched data file. Run `python src/generate_data.py` and `python src/analyze_data.py` first.")
     st.stop()
 
-if "analyst_actions" not in st.session_state:
-    st.session_state.analyst_actions = {}
-
-data_mtime = RAW_DATA_FILE.stat().st_mtime
+data_mtime = DATA_FILE.stat().st_mtime
+raw_df = load_transaction_data(data_mtime)
+analyst_actions = load_analyst_actions()
 
 # ----------------- SIDEBAR CONTROLS -----------------
 st.sidebar.title("Filters & tuning")
 
-st.sidebar.subheader("IQR sensitivity")
+# Date Filter
+min_date = raw_df["timestamp"].dt.date.min()
+max_date = raw_df["timestamp"].dt.date.max()
+selected_dates = st.sidebar.date_input("Date Range", [min_date, max_date], min_value=min_date, max_value=max_date)
+
+# Risk Level Filter
+available_risk_levels = ["High", "Medium", "Low"]
+selected_risk_levels = st.sidebar.multiselect(
+    "Risk Tiers", options=available_risk_levels, default=["High", "Medium"]
+)
+
+# UPI Channel Filter
+available_channels = list(raw_df["upi_channel"].unique())
+selected_channels = st.sidebar.multiselect("UPI Channel", options=available_channels, default=available_channels)
+
+# Merchant Category Filter
+available_categories = list(raw_df["merchant_category"].unique())
+selected_categories = st.sidebar.multiselect("Merchant Category", options=available_categories, default=available_categories)
+
+# City Filter
+available_cities = list(raw_df["location"].unique())
+selected_cities = st.sidebar.multiselect("Cities", options=available_cities, default=available_cities)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ Live IQR Sensitivity Tuning")
 iqr_mult = st.sidebar.slider(
-    "IQR multiplier",
+    "IQR Multiplier (Fence Sensitivity)",
     min_value=1.0,
     max_value=3.5,
     value=1.5,
     step=0.25,
-    help="Tukey fence multiplier. Lower values pull more payments into the review queue.",
+    help="Default is 1.5x (standard Tukey's fence). Lower values increase review queue size (higher sensitivity).",
 )
 
-scored_df, iqr_upper_limit = load_scored_transactions(float(iqr_mult), data_mtime)
-st.sidebar.caption(f"Amount IQR cutoff: **INR {iqr_upper_limit:,.2f}**")
+scored_df, dynamic_iqr_limit = score_dashboard_data(raw_df, float(iqr_mult))
+st.sidebar.caption(f"Amount IQR cutoff: **INR {dynamic_iqr_limit:,.2f}**")
 
-min_date = scored_df["timestamp"].dt.date.min()
-max_date = scored_df["timestamp"].dt.date.max()
-selected_dates = st.sidebar.date_input("Date range", [min_date, max_date], min_value=min_date, max_value=max_date)
-
-available_risk_levels = ["High", "Medium", "Low"]
-selected_risk_levels = st.sidebar.multiselect(
-    "Risk tiers", options=available_risk_levels, default=["High", "Medium"]
-)
-
-available_channels = list(scored_df["upi_channel"].unique())
-selected_channels = st.sidebar.multiselect("UPI channel", options=available_channels, default=available_channels)
-
-available_categories = list(scored_df["merchant_category"].unique())
-selected_categories = st.sidebar.multiselect(
-    "Merchant category", options=available_categories, default=available_categories
-)
-
-available_cities = list(scored_df["location"].unique())
-selected_cities = st.sidebar.multiselect("Cities", options=available_cities, default=available_cities)
-
+# Apply Filters
 mask = (
     (scored_df["upi_channel"].isin(selected_channels))
     & (scored_df["merchant_category"].isin(selected_categories))
@@ -207,7 +279,7 @@ if selected_risk_levels:
 filtered_df = scored_df[mask].copy()
 
 if filtered_df.empty:
-    st.warning("No transactions match the selected filters. Adjust the sidebar filters.")
+    st.warning("⚠️ No transactions match the selected filters. Please adjust your criteria in the sidebar.")
     st.stop()
 
 # ----------------- MAIN HEADER & KPI METRICS -----------------
@@ -261,7 +333,7 @@ with tab_queue:
 
     # Add Action Status column from session state
     display_df["analyst_status"] = display_df["transaction_id"].map(
-        lambda tid: st.session_state.analyst_actions.get(tid, "Pending Review")
+        lambda tid: analyst_actions.get(tid, "Pending Review")
     )
 
     columns_to_render = [
@@ -311,24 +383,24 @@ with tab_queue:
             b1, b2, b3 = st.columns(3)
             with b1:
                 if st.button("✅ Approve", key="btn_app"):
-                    st.session_state.analyst_actions[selected_tx] = "Approved ✅"
+                    save_analyst_action(selected_tx, "Approved ✅")
                     st.success(f"{selected_tx} marked Approved!")
                     st.rerun()
             with b2:
                 if st.button("⚠️ Verify KYC", key="btn_ver"):
-                    st.session_state.analyst_actions[selected_tx] = "KYC Triggered ⚠️"
+                    save_analyst_action(selected_tx, "KYC Triggered ⚠️")
                     st.warning(f"Verification OTP sent for {selected_tx}")
                     st.rerun()
             with b3:
                 if st.button("🚫 Block Account", key="btn_blk"):
-                    st.session_state.analyst_actions[selected_tx] = "Blocked 🚫"
+                    save_analyst_action(selected_tx, "Blocked 🚫")
                     st.error(f"{selected_tx} sender frozen!")
                     st.rerun()
 
         # Per-transaction explainability: exactly why this score, rule by rule
         st.markdown("---")
         with st.expander(f"🧬 Explainability Breakdown — {selected_tx}", expanded=True):
-            render_explanation(tx_row, iqr_upper_limit)
+            render_explanation(tx_row, dynamic_iqr_limit)
 
 
 # ================= TAB 2: RISK ANALYTICS & PATTERNS =================
@@ -414,10 +486,10 @@ with tab_analytics:
             title="Log Scale Amount Spread per Merchant Category",
         )
         fig_box.add_hline(
-            y=iqr_upper_limit,
+            y=dynamic_iqr_limit,
             line_dash="dash",
             line_color="red",
-            annotation_text=f"IQR cutoff: INR {iqr_upper_limit:,.0f}",
+            annotation_text=f"IQR Cutoff: INR {dynamic_iqr_limit:,.0f}",
         )
         fig_box.update_layout(showlegend=False, margin=dict(l=20, r=20, t=40, b=20), height=330)
         st.plotly_chart(fig_box, use_container_width=True)
@@ -519,11 +591,11 @@ with tab_ml_benchmark:
 with tab_sql:
     st.subheader("SQL Analytics Lab (SQLite Engine)")
     st.caption(
-        f"Pre-built queries are loaded from `{SQL_QUERIES_FILE.relative_to(PROJECT_ROOT).as_posix()}`. "
-        "The in-memory database reflects the full scored dataset at your current IQR setting."
+        f"Templates load from `{SQL_QUERIES_FILE.relative_to(PROJECT_ROOT).as_posix()}`. "
+        "The database reflects the scored dataset at your current IQR setting."
     )
 
-    conn = sqlite_connection_from_frame(scored_df)
+    conn = get_sqlite_connection(scored_df)
 
     try:
         queries = load_named_queries(SQL_QUERIES_FILE)
@@ -537,11 +609,11 @@ with tab_sql:
     selected_query_name = st.selectbox("Pre-built query", options=list(queries.keys()))
     default_sql = queries[selected_query_name].strip()
 
-    sql_text = st.text_area("SQL editor", value=default_sql, height=140)
+    sql_text = st.text_area("SQL Editor", value=default_sql, height=140)
 
-    if st.button("Run query", key="btn_run_sql"):
+    if st.button("▶️ Execute Query", key="btn_run_sql"):
         try:
-            sql_result = pd.read_sql_query(sql_text, conn)
+            sql_result = run_read_only_query(conn, sql_text)
             st.success(f"Query returned {len(sql_result):,} rows.")
             st.dataframe(sql_result, use_container_width=True)
         except Exception as e:

@@ -27,6 +27,16 @@ REQUIRED_UPLOAD_COLUMNS = ["timestamp", "amount", "sender_id", "receiver_id", "u
 # Extra columns needed for the Isolation Forest benchmark (optional on upload)
 ML_FEATURE_COLUMNS = ["merchant_category", "device_type"]
 
+# Values used by the synthetic benchmark and by the public scoring wrappers.
+# Keeping them in one place makes the benchmark tunable without changing the
+# default behaviour of existing callers.
+ISOLATION_FOREST_DEFAULT_CONTAMINATION = 0.035
+ISOLATION_FOREST_DEFAULT_N_ESTIMATORS = 100
+ISOLATION_FOREST_DEFAULT_SEED = 42
+
+VALID_UPI_CHANNELS = frozenset({"App", "QR", "Collect Request"})
+ID_COLUMNS = ("transaction_id", "sender_id", "receiver_id")
+
 
 def calculate_iqr_limit(amounts: pd.Series, multiplier: float = 1.5) -> float:
     """Calculate the upper outlier cutoff using Tukey's IQR fence method."""
@@ -56,6 +66,49 @@ def compute_rolling_velocity(df: pd.DataFrame, window_mins: int = 15) -> pd.Seri
     return pd.Series(rolling_counts, index=df.index, dtype=int)
 
 
+def _parse_timestamp_values(values: pd.Series) -> tuple[pd.Series, set[bool]]:
+    """Parse timestamp values one at a time and report timezone awareness.
+
+    Pandas raises on a Series containing mixed timezone offsets unless ``utc``
+    is supplied. Parsing scalars first lets validation distinguish an invalid
+    timestamp from a valid, timezone-aware timestamp and from a mixture of
+    aware and naive values.
+    """
+    parsed_values: list[pd.Timestamp | pd.NaT] = []
+    timezone_awareness: set[bool] = set()
+
+    for value in values:
+        try:
+            parsed = pd.to_datetime(value, errors="coerce", format="mixed")
+        except (TypeError, ValueError, OverflowError):
+            parsed = pd.NaT
+
+        if pd.isna(parsed):
+            parsed_values.append(pd.NaT)
+            continue
+
+        parsed = pd.Timestamp(parsed)
+        is_timezone_aware = parsed.tzinfo is not None and parsed.utcoffset() is not None
+        timezone_awareness.add(is_timezone_aware)
+        parsed_values.append(parsed)
+
+    parsed_series = pd.Series(parsed_values, index=values.index, name=values.name)
+    if timezone_awareness == {True}:
+        # Keep a shared offset (and therefore its local hour-of-day) when
+        # possible. If values use different offsets, normalize to UTC so they
+        # remain sortable and compatible with pandas' datetime accessors.
+        try:
+            parsed_series = pd.to_datetime(parsed_series, format="mixed")
+            if not pd.api.types.is_datetime64_any_dtype(parsed_series):
+                raise ValueError("mixed timezone offsets produced an object series")
+        except (TypeError, ValueError):
+            parsed_series = pd.to_datetime(parsed_series, errors="coerce", utc=True)
+    elif timezone_awareness == {False}:
+        parsed_series = pd.to_datetime(parsed_series, errors="coerce", format="mixed")
+
+    return parsed_series, timezone_awareness
+
+
 def evaluate_rules(
     df: pd.DataFrame,
     iqr_multiplier: float = 1.5,
@@ -65,7 +118,10 @@ def evaluate_rules(
     """Evaluate explainable multi-factor risk rules on UPI transactions."""
     df = df.copy()
     if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        parsed_timestamps, timezone_awareness = _parse_timestamp_values(df["timestamp"])
+        if len(timezone_awareness) > 1:
+            raise ValueError("'timestamp' mixes timezone-aware and timezone-naive values.")
+        df["timestamp"] = parsed_timestamps
 
     df = df.sort_values("timestamp").reset_index(drop=True)
 
@@ -199,8 +255,31 @@ def explain_transaction(
     }
 
 
-def train_isolation_forest(df: pd.DataFrame, contamination: float = 0.035, seed: int = 42) -> pd.DataFrame:
+def _validate_isolation_forest_config(
+    contamination: float | str,
+    n_estimators: int,
+) -> None:
+    """Validate options before passing them to scikit-learn."""
+    if contamination != "auto":
+        try:
+            contamination_value = float(contamination)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("contamination must be a number in (0, 0.5] or 'auto'.") from exc
+        if not 0 < contamination_value <= 0.5:
+            raise ValueError("contamination must be a number in (0, 0.5] or 'auto'.")
+
+    if isinstance(n_estimators, bool) or not isinstance(n_estimators, (int, np.integer)) or n_estimators < 1:
+        raise ValueError("n_estimators must be a positive integer.")
+
+
+def train_isolation_forest(
+    df: pd.DataFrame,
+    contamination: float | str = ISOLATION_FOREST_DEFAULT_CONTAMINATION,
+    seed: int = ISOLATION_FOREST_DEFAULT_SEED,
+    n_estimators: int = ISOLATION_FOREST_DEFAULT_N_ESTIMATORS,
+) -> pd.DataFrame:
     """Train an unsupervised Isolation Forest model to benchmark against rule-based scoring."""
+    _validate_isolation_forest_config(contamination, n_estimators)
     df = df.copy()
 
     # Feature engineering for ML
@@ -212,11 +291,12 @@ def train_isolation_forest(df: pd.DataFrame, contamination: float = 0.035, seed:
     features["is_ios"] = (df["device_type"] == "iOS").astype(int)
 
     # Frequency encoding for category
-    cat_freq = df["merchant_category"].value_counts(normalize=True)
-    features["category_freq"] = df["merchant_category"].map(cat_freq)
+    merchant_categories = df["merchant_category"].astype("string").fillna("<missing>")
+    cat_freq = merchant_categories.value_counts(normalize=True)
+    features["category_freq"] = merchant_categories.map(cat_freq).fillna(0.0)
 
     iso = IsolationForest(
-        n_estimators=100,
+        n_estimators=n_estimators,
         contamination=contamination,
         random_state=seed,
         n_jobs=-1,
@@ -258,10 +338,28 @@ def calculate_metrics(y_true: pd.Series, y_pred: pd.Series) -> dict[str, float]:
     }
 
 
-def add_iqr_alerts(transactions: pd.DataFrame) -> tuple[pd.DataFrame, float]:
-    """Backwards-compatible wrapper adding multi-factor rules and ML model."""
+def add_iqr_alerts(
+    transactions: pd.DataFrame,
+    *,
+    run_ml: bool = True,
+    contamination: float | str = ISOLATION_FOREST_DEFAULT_CONTAMINATION,
+    seed: int = ISOLATION_FOREST_DEFAULT_SEED,
+    n_estimators: int = ISOLATION_FOREST_DEFAULT_N_ESTIMATORS,
+) -> tuple[pd.DataFrame, float]:
+    """Backwards-compatible wrapper adding rules and an optional ML benchmark.
+
+    The default still adds Isolation Forest predictions exactly as before.
+    Callers that only need deterministic rules can set ``run_ml=False``; the
+    remaining options tune the benchmark without changing its output columns.
+    """
     df, upper_limit = evaluate_rules(transactions)
-    df = train_isolation_forest(df)
+    if run_ml and all(column in df.columns for column in ML_FEATURE_COLUMNS):
+        df = train_isolation_forest(
+            df,
+            contamination=contamination,
+            seed=seed,
+            n_estimators=n_estimators,
+        )
     return df, upper_limit
 
 
@@ -282,18 +380,59 @@ def validate_transaction_upload(df: pd.DataFrame) -> list[str]:
         problems.append("The file contains no transaction rows.")
         return problems
 
+    # A transaction ID is optional (the scorer generates one when absent),
+    # but supplied IDs must be usable and unique. Sender and receiver IDs are
+    # required and may legitimately repeat across transactions.
+    for column in ID_COLUMNS:
+        if column not in df.columns:
+            continue
+
+        normalized_ids = df[column].astype("string").str.strip()
+        empty_mask = normalized_ids.isna() | normalized_ids.eq("")
+        empty_count = int(empty_mask.sum())
+        if empty_count:
+            problems.append(f"'{column}' has {empty_count} empty value(s).")
+
+        if column == "transaction_id":
+            non_empty_ids = normalized_ids.loc[~empty_mask]
+            duplicate_mask = non_empty_ids.duplicated(keep=False)
+            duplicate_count = int(duplicate_mask.sum())
+            if duplicate_count:
+                duplicate_values = int(non_empty_ids.loc[duplicate_mask].nunique())
+                problems.append(
+                    f"'transaction_id' contains {duplicate_values} duplicate value(s) "
+                    f"across {duplicate_count} row(s)."
+                )
+
+    if "upi_channel" in df.columns:
+        channels = df["upi_channel"].astype("string").str.strip()
+        invalid_mask = channels.isna() | ~channels.isin(VALID_UPI_CHANNELS)
+        invalid_count = int(invalid_mask.sum())
+        if invalid_count:
+            allowed = ", ".join(sorted(VALID_UPI_CHANNELS))
+            problems.append(
+                f"'upi_channel' has {invalid_count} invalid value(s). "
+                f"Allowed values: {allowed}."
+            )
+
     if "amount" in df.columns:
         amounts = pd.to_numeric(df["amount"], errors="coerce")
         if amounts.isna().any():
             problems.append(f"'amount' has {int(amounts.isna().sum())} value(s) that are not numeric.")
-        elif (amounts <= 0).any():
+        if (amounts.dropna() <= 0).any():
             problems.append("'amount' must be strictly positive.")
 
     if "timestamp" in df.columns:
-        parsed = pd.to_datetime(df["timestamp"], errors="coerce", format="mixed")
+        parsed, timezone_awareness = _parse_timestamp_values(df["timestamp"])
         if parsed.isna().any():
             problems.append(
-                f"'timestamp' has {int(parsed.isna().sum())} value(s) that could not be parsed as dates."
+                f"'timestamp' has {int(parsed.isna().sum())} value(s) that could not be parsed "
+                "as dates or valid timezones."
+            )
+        if len(timezone_awareness) > 1:
+            problems.append(
+                "'timestamp' mixes timezone-aware and timezone-naive values; "
+                "use one consistent timezone."
             )
 
     return problems
@@ -302,11 +441,18 @@ def validate_transaction_upload(df: pd.DataFrame) -> list[str]:
 def score_uploaded_transactions(
     df: pd.DataFrame,
     iqr_multiplier: float = 1.5,
+    *,
+    run_ml: bool = True,
+    contamination: float | str = ISOLATION_FOREST_DEFAULT_CONTAMINATION,
+    seed: int = ISOLATION_FOREST_DEFAULT_SEED,
+    n_estimators: int = ISOLATION_FOREST_DEFAULT_N_ESTIMATORS,
 ) -> tuple[pd.DataFrame, float]:
     """Score a user-supplied transaction frame with the explainable rule engine.
 
-    Runs the Isolation Forest benchmark as well when the optional feature
-    columns (merchant_category, device_type) are present.
+    Runs the Isolation Forest benchmark by default when the optional feature
+    columns (merchant_category, device_type) are present. Set ``run_ml=False``
+    to return rule-based results only, or pass the benchmark options to tune
+    the model.
     Raises ValueError listing every validation problem when the data is unusable.
     """
     problems = validate_transaction_upload(df)
@@ -314,26 +460,44 @@ def score_uploaded_transactions(
         raise ValueError("\n".join(problems))
 
     scored = df.copy()
-    scored["timestamp"] = pd.to_datetime(scored["timestamp"], errors="coerce", format="mixed")
+    scored["timestamp"], _ = _parse_timestamp_values(scored["timestamp"])
     scored["amount"] = pd.to_numeric(scored["amount"], errors="coerce")
+    scored["upi_channel"] = scored["upi_channel"].astype("string").str.strip()
 
     if "transaction_id" not in scored.columns:
         scored.insert(0, "transaction_id", [f"UPLOAD{i:05d}" for i in range(1, len(scored) + 1)])
 
     scored, upper_limit = evaluate_rules(scored, iqr_multiplier=iqr_multiplier)
 
-    if all(column in scored.columns for column in ML_FEATURE_COLUMNS):
-        scored = train_isolation_forest(scored)
+    if run_ml and all(column in scored.columns for column in ML_FEATURE_COLUMNS):
+        scored = train_isolation_forest(
+            scored,
+            contamination=contamination,
+            seed=seed,
+            n_estimators=n_estimators,
+        )
 
     return scored, upper_limit
 
 
-def main() -> None:
+def main(
+    *,
+    run_ml: bool = True,
+    contamination: float | str = ISOLATION_FOREST_DEFAULT_CONTAMINATION,
+    seed: int = ISOLATION_FOREST_DEFAULT_SEED,
+    n_estimators: int = ISOLATION_FOREST_DEFAULT_N_ESTIMATORS,
+) -> None:
     if not INPUT_FILE.exists():
         raise FileNotFoundError("Run `python src/generate_data.py` first.")
 
     transactions = pd.read_csv(INPUT_FILE, parse_dates=["timestamp"])
-    enriched_df, upper_limit = add_iqr_alerts(transactions)
+    enriched_df, upper_limit = add_iqr_alerts(
+        transactions,
+        run_ml=run_ml,
+        contamination=contamination,
+        seed=seed,
+        n_estimators=n_estimators,
+    )
     OUTPUT_FILE.parent.mkdir(exist_ok=True)
     enriched_df.to_csv(OUTPUT_FILE, index=False)
 
@@ -343,8 +507,6 @@ def main() -> None:
     print(f"Transactions in Review Queue: {enriched_df['in_review_queue'].sum():,}")
 
     rule_metrics = calculate_metrics(enriched_df["risk_flag"], enriched_df["in_review_queue"])
-    ml_metrics = calculate_metrics(enriched_df["risk_flag"], enriched_df["ml_prediction"])
-
     print("\n--- Rule-Based Engine Performance vs Synthetic Injected Ground Truth ---")
     print(f"True Positives:  {rule_metrics['tp']:,} / {enriched_df['risk_flag'].sum():,}")
     print(f"False Positives: {rule_metrics['fp']:,}")
@@ -352,15 +514,19 @@ def main() -> None:
     print(f"Recall:          {rule_metrics['recall']:.2%}")
     print(f"F1 Score:        {rule_metrics['f1']:.2%}")
 
-    print("\n--- Isolation Forest (ML) Performance ---")
-    print(f"True Positives:  {ml_metrics['tp']:,} / {enriched_df['risk_flag'].sum():,}")
-    print(f"False Positives: {ml_metrics['fp']:,}")
-    print(f"Precision:       {ml_metrics['precision']:.2%}")
-    print(f"Recall:          {ml_metrics['recall']:.2%}")
-    print(f"F1 Score:        {ml_metrics['f1']:.2%}")
+    if "ml_prediction" in enriched_df.columns:
+        ml_metrics = calculate_metrics(enriched_df["risk_flag"], enriched_df["ml_prediction"])
+        print("\n--- Isolation Forest (ML) Performance ---")
+        print(f"True Positives:  {ml_metrics['tp']:,} / {enriched_df['risk_flag'].sum():,}")
+        print(f"False Positives: {ml_metrics['fp']:,}")
+        print(f"Precision:       {ml_metrics['precision']:.2%}")
+        print(f"Recall:          {ml_metrics['recall']:.2%}")
+        print(f"F1 Score:        {ml_metrics['f1']:.2%}")
 
-    both = ((enriched_df["in_review_queue"] == 1) & (enriched_df["ml_prediction"] == 1)).sum()
-    print(f"\nAgreed Detections (Both Rules & ML): {both:,}")
+        both = ((enriched_df["in_review_queue"] == 1) & (enriched_df["ml_prediction"] == 1)).sum()
+        print(f"\nAgreed Detections (Both Rules & ML): {both:,}")
+    else:
+        print("\n--- Isolation Forest (ML) Benchmark skipped ---")
     print(f"Saved enriched data: {OUTPUT_FILE}")
 
 

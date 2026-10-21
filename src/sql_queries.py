@@ -21,7 +21,8 @@ def load_named_queries(sql_path: Path) -> dict[str, str]:
         body = match.group("body")
         lines = [line for line in body.splitlines() if not line.strip().startswith("--")]
         sql = "\n".join(lines).strip().rstrip(";")
-        if sql.upper().startswith("SELECT"):
+        first_token = sql.lstrip().split(None, 1)[0].upper() if sql else ""
+        if first_token in {"SELECT", "WITH"}:
             queries[title] = sql
 
     if not queries:
