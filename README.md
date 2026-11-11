@@ -56,6 +56,6 @@ Rules are fully explainable (fixed reasons per alert). Isolation Forest is an op
 - **SQL lab** — queries loaded from `sql/analysis.sql`; read-only `SELECT`/`WITH` only.
 - **Upload CSV** — same engine as the main dataset. Required: `timestamp`, `amount`, `sender_id`, `receiver_id`, `upi_channel`. Add `merchant_category` and `device_type` for ML columns.
 
-Upload validation checks required columns, positive amounts, parseable timestamps, duplicate IDs, empty sender/receiver IDs, and supported UPI channels.
+Upload validation checks required columns, positive amounts, parseable timestamps, duplicate IDs, empty sender/receiver IDs, and supported UPI channels (`App`, `QR`, `Collect Request`).
 
 Velocity bursts in the generator are explicit three-transaction windows so the synthetic benchmark lines up with the detector.
