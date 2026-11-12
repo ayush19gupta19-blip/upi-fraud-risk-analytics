@@ -191,6 +191,16 @@ class AnalyzeDataTests(unittest.TestCase):
         self.assertTrue(any("sender_id" in problem and "empty" in problem for problem in problems))
         self.assertTrue(any("receiver_id" in problem and "empty" in problem for problem in problems))
 
+    def test_validate_transaction_upload_rejects_empty_identifiers_after_trimming(self):
+        invalid = sample_transactions()
+        invalid.loc[0, "sender_id"] = "   "
+        invalid.loc[1, "receiver_id"] = pd.NA
+
+        problems = validate_transaction_upload(invalid)
+
+        self.assertTrue(any("sender_id" in problem and "empty" in problem for problem in problems))
+        self.assertTrue(any("receiver_id" in problem and "empty" in problem for problem in problems))
+
     def test_validate_transaction_upload_rejects_invalid_channels_and_mixed_timezones(self):
         invalid = sample_transactions()
         invalid.loc[0, "upi_channel"] = "Bank Transfer"
