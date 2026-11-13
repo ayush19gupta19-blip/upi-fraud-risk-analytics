@@ -51,19 +51,21 @@ def calculate_iqr_limit(amounts: pd.Series, multiplier: float = 1.5) -> float:
 def compute_rolling_velocity(df: pd.DataFrame, window_mins: int = 15) -> pd.Series:
     """Compute rolling transaction count per sender within a sliding time window (vectorized)."""
     window_ns = np.timedelta64(window_mins, "m")
-    rolling_counts = np.ones(len(df), dtype=int)
+    original_index = df.index
+    positional = df.reset_index(drop=True)
+    rolling_counts = np.ones(len(positional), dtype=int)
 
     # df is guaranteed to be sorted by timestamp
-    for _, indices in df.groupby("sender_id").groups.items():
+    for _, indices in positional.groupby("sender_id").groups.items():
         if len(indices) <= 1:
             continue
         sub_indices = np.array(indices)
-        times = df.loc[sub_indices, "timestamp"].values
+        times = positional.loc[sub_indices, "timestamp"].values
         left_bounds = np.searchsorted(times, times - window_ns, side="left")
         counts = np.arange(len(times)) - left_bounds + 1
         rolling_counts[sub_indices] = counts
 
-    return pd.Series(rolling_counts, index=df.index, dtype=int)
+    return pd.Series(rolling_counts, index=original_index, dtype=int)
 
 
 def _parse_timestamp_values(values: pd.Series) -> tuple[pd.Series, set[bool]]:

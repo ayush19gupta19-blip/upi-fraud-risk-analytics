@@ -65,6 +65,22 @@ class AnalyzeDataTests(unittest.TestCase):
         counts = compute_rolling_velocity(df, window_mins=15)
         self.assertEqual(list(counts), [1, 1, 2, 1])
 
+    def test_compute_rolling_velocity_preserves_nonconsecutive_index(self):
+        df = pd.DataFrame(
+            {
+                "sender_id": ["USER_A", "USER_A", "USER_A"],
+                "timestamp": pd.to_datetime(
+                    ["2026-01-01 10:00", "2026-01-01 10:04", "2026-01-01 10:25"]
+                ),
+            },
+            index=[10, 20, 40],
+        )
+
+        counts = compute_rolling_velocity(df, window_mins=15)
+
+        self.assertEqual(counts.index.tolist(), [10, 20, 40])
+        self.assertEqual(counts.tolist(), [1, 2, 1])
+
     def test_multi_factor_rules(self):
         # Create a small deterministic dataset
         data = pd.DataFrame(
