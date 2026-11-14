@@ -50,6 +50,8 @@ def calculate_iqr_limit(amounts: pd.Series, multiplier: float = 1.5) -> float:
 
 def compute_rolling_velocity(df: pd.DataFrame, window_mins: int = 15) -> pd.Series:
     """Compute rolling transaction count per sender within a sliding time window (vectorized)."""
+    if window_mins < 0:
+        raise ValueError("window_mins must be non-negative")
     window_ns = np.timedelta64(window_mins, "m")
     original_index = df.index
     positional = df.reset_index(drop=True)

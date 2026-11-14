@@ -81,6 +81,17 @@ class AnalyzeDataTests(unittest.TestCase):
         self.assertEqual(counts.index.tolist(), [10, 20, 40])
         self.assertEqual(counts.tolist(), [1, 2, 1])
 
+    def test_compute_rolling_velocity_rejects_negative_window(self):
+        df = pd.DataFrame(
+            {
+                "sender_id": ["USER_A"],
+                "timestamp": [pd.Timestamp("2026-01-01 10:00:00")],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "window_mins must be non-negative"):
+            compute_rolling_velocity(df, window_mins=-1)
+
     def test_multi_factor_rules(self):
         # Create a small deterministic dataset
         data = pd.DataFrame(
