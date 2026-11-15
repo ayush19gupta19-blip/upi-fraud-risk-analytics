@@ -206,6 +206,14 @@ class AnalyzeDataTests(unittest.TestCase):
         empty = sample_transactions().iloc[0:0]
         self.assertTrue(any("no transaction rows" in problem for problem in validate_transaction_upload(empty)))
 
+    def test_validate_transaction_upload_rejects_infinite_amounts(self):
+        invalid = sample_transactions()
+        invalid.loc[0, "amount"] = float("inf")
+
+        problems = validate_transaction_upload(invalid)
+
+        self.assertTrue(any("amount" in problem and "non-finite" in problem for problem in problems))
+
     def test_validate_transaction_upload_rejects_duplicate_and_empty_ids(self):
         invalid = sample_transactions()
         invalid.loc[1, "transaction_id"] = invalid.loc[0, "transaction_id"]

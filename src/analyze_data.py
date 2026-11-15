@@ -423,6 +423,9 @@ def validate_transaction_upload(df: pd.DataFrame) -> list[str]:
         amounts = pd.to_numeric(df["amount"], errors="coerce")
         if amounts.isna().any():
             problems.append(f"'amount' has {int(amounts.isna().sum())} value(s) that are not numeric.")
+        non_finite_count = int((amounts.notna() & ~np.isfinite(amounts)).sum())
+        if non_finite_count:
+            problems.append(f"'amount' has {non_finite_count} non-finite value(s).")
         if (amounts.dropna() <= 0).any():
             problems.append("'amount' must be strictly positive.")
 
