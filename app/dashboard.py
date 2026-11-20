@@ -25,6 +25,7 @@ from src.analyze_data import (
     score_uploaded_transactions,
     validate_transaction_upload,
 )
+from src.sender_risk import build_sender_risk_export
 from src.sql_queries import load_named_queries
 
 st.set_page_config(
@@ -303,10 +304,11 @@ c5.metric("Total Volume", f"INR {total_volume / 1e6:.2f}M")
 st.markdown("---")
 
 # ----------------- TABS LAYOUT -----------------
-tab_queue, tab_analytics, tab_ml_benchmark, tab_sql, tab_upload = st.tabs([
+tab_queue, tab_analytics, tab_ml_benchmark, tab_sender, tab_sql, tab_upload = st.tabs([
     "🚨 Operational Review Queue",
     "📈 Risk Analytics & Patterns",
     "🤖 ML vs. Rule Benchmark",
+    "👤 Sender Risk Intelligence",
     "🗄️ Interactive SQL Lab",
     "📤 Score Your Own CSV",
 ])
@@ -587,7 +589,123 @@ with tab_ml_benchmark:
     st.plotly_chart(fig_scatter, use_container_width=True)
 
 
-# ================= TAB 4: SQL LAB =================
+# ================= TAB 4: SENDER RISK INTELLIGENCE =================
+with tab_sender:
+    st.subheader("Sender Behavioral Risk Intelligence")
+    st.caption(
+        "Second-pass profiles built from the filtered view: personal amount fences, "
+        "sender risk index, and high fan-in receivers. Does not rewrite the composite rule score."
+    )
+
+    with st.spinner("Building sender profiles..."):
+        annotated_view, sender_board, receiver_board = build_sender_risk_export(filtered_df)
+
+    s1, s2, s3, s4 = st.columns(4)
+    high_senders = int((sender_board["sender_risk_tier"] == "High").sum()) if not sender_board.empty else 0
+    anomaly_hits = int(annotated_view["sender_amount_anomaly"].sum()) if not annotated_view.empty else 0
+    fan_in = int(receiver_board["high_fan_in"].sum()) if not receiver_board.empty else 0
+    s1.metric("Senders profiled", f"{len(sender_board):,}")
+    s2.metric("High-tier senders", f"{high_senders:,}", delta_color="inverse")
+    s3.metric("Personal amount anomalies", f"{anomaly_hits:,}")
+    s4.metric("High fan-in receivers", f"{fan_in:,}")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("##### Top senders by risk index")
+        board_cols = [
+            col
+            for col in (
+                "sender_id",
+                "sender_risk_index",
+                "sender_risk_tier",
+                "txn_count",
+                "mean_rule_score",
+                "review_queue_hits",
+                "sender_anomaly_hits",
+                "night_share",
+                "unique_receivers",
+                "total_volume",
+            )
+            if col in sender_board.columns
+        ]
+        st.dataframe(
+            sender_board[board_cols].head(50),
+            use_container_width=True,
+            column_config={
+                "sender_risk_index": st.column_config.ProgressColumn(
+                    "Sender risk index", min_value=0, max_value=100, format="%.1f"
+                ),
+                "total_volume": st.column_config.NumberColumn("Volume (INR)", format="₹ %.0f"),
+                "night_share": st.column_config.NumberColumn("Night share", format="%.1%"),
+            },
+            height=360,
+        )
+    with right:
+        st.markdown("##### High fan-in receivers (collection pattern)")
+        fan_cols = [
+            c
+            for c in ("receiver_id", "unique_senders", "txn_count", "total_volume", "high_fan_in")
+            if c in receiver_board.columns
+        ]
+        st.dataframe(
+            receiver_board[fan_cols].head(30),
+            use_container_width=True,
+            column_config={
+                "total_volume": st.column_config.NumberColumn("Volume (INR)", format="₹ %.0f"),
+            },
+            height=360,
+        )
+
+    st.markdown("##### Transactions that breach the sender's personal amount fence")
+    personal = annotated_view[annotated_view["sender_amount_anomaly"] == 1].copy()
+    if personal.empty:
+        st.info("No personal-baseline amount anomalies in the current filter set.")
+    else:
+        show_cols = [
+            c
+            for c in (
+                "transaction_id",
+                "timestamp",
+                "sender_id",
+                "amount",
+                "amount_vs_sender_median",
+                "personal_upper_fence",
+                "risk_score",
+                "review_reason",
+            )
+            if c in personal.columns
+        ]
+        st.dataframe(
+            personal.sort_values("amount", ascending=False)[show_cols].head(100),
+            use_container_width=True,
+            column_config={
+                "amount": st.column_config.NumberColumn("Amount (INR)", format="₹ %.2f"),
+                "personal_upper_fence": st.column_config.NumberColumn("Personal fence", format="₹ %.2f"),
+                "amount_vs_sender_median": st.column_config.NumberColumn("x sender median", format="%.1f"),
+            },
+            height=320,
+        )
+
+    c_dl1, c_dl2 = st.columns(2)
+    with c_dl1:
+        st.download_button(
+            "Download sender leaderboard",
+            data=sender_board.to_csv(index=False).encode("utf-8"),
+            file_name="sender_risk_profiles.csv",
+            mime="text/csv",
+            key="dl_sender_board",
+        )
+    with c_dl2:
+        st.download_button(
+            "Download receiver fan-in",
+            data=receiver_board.to_csv(index=False).encode("utf-8"),
+            file_name="receiver_fan_in.csv",
+            mime="text/csv",
+            key="dl_receiver_board",
+        )
+
+
+# ================= TAB 5: SQL LAB =================
 with tab_sql:
     st.subheader("SQL Analytics Lab (SQLite Engine)")
     st.caption(
@@ -620,7 +738,7 @@ with tab_sql:
             st.error(f"SQL Execution Error: {e}")
 
 
-# ================= TAB 5: SCORE YOUR OWN CSV =================
+# ================= TAB 6: SCORE YOUR OWN CSV =================
 with tab_upload:
     st.subheader("Score Your Own Transaction CSV")
     st.caption(

@@ -514,7 +514,7 @@ def main(
     print(f"Transactions in Review Queue: {enriched_df['in_review_queue'].sum():,}")
 
     rule_metrics = calculate_metrics(enriched_df["risk_flag"], enriched_df["in_review_queue"])
-    print("\n--- Rule-Based Engine Performance vs Synthetic Injected Ground Truth ---")
+    print('\n--- Rule-Based Engine Performance vs Synthetic Injected Ground Truth ---')
     print(f"True Positives:  {rule_metrics['tp']:,} / {enriched_df['risk_flag'].sum():,}")
     print(f"False Positives: {rule_metrics['fp']:,}")
     print(f"Precision:       {rule_metrics['precision']:.2%}")
@@ -523,7 +523,7 @@ def main(
 
     if "ml_prediction" in enriched_df.columns:
         ml_metrics = calculate_metrics(enriched_df["risk_flag"], enriched_df["ml_prediction"])
-        print("\n--- Isolation Forest (ML) Performance ---")
+        print('\n--- Isolation Forest (ML) Performance ---')
         print(f"True Positives:  {ml_metrics['tp']:,} / {enriched_df['risk_flag'].sum():,}")
         print(f"False Positives: {ml_metrics['fp']:,}")
         print(f"Precision:       {ml_metrics['precision']:.2%}")
@@ -533,8 +533,28 @@ def main(
         both = ((enriched_df["in_review_queue"] == 1) & (enriched_df["ml_prediction"] == 1)).sum()
         print(f"\nAgreed Detections (Both Rules & ML): {both:,}")
     else:
-        print("\n--- Isolation Forest (ML) Benchmark skipped ---")
+        print('\n--- Isolation Forest (ML) Benchmark skipped ---')
     print(f"Saved enriched data: {OUTPUT_FILE}")
+
+    # Second-pass behavioral intelligence (does not rewrite the composite score).
+    from src.sender_risk import DEFAULT_OUTPUT as SENDER_PROFILES_FILE
+    from src.sender_risk import build_sender_risk_export
+
+    annotated, leaderboard, receivers = build_sender_risk_export(enriched_df)
+    # Persist anomaly columns alongside the scored file for dashboard use.
+    annotated.to_csv(OUTPUT_FILE, index=False)
+    SENDER_PROFILES_FILE.parent.mkdir(exist_ok=True)
+    leaderboard.to_csv(SENDER_PROFILES_FILE, index=False)
+    receivers_path = PROJECT_ROOT / "data" / "receiver_fan_in.csv"
+    receivers.to_csv(receivers_path, index=False)
+    high_senders = int((leaderboard["sender_risk_tier"] == "High").sum())
+    print('\n--- Sender Behavioral Risk Intelligence ---')
+    print(f"Senders profiled:           {len(leaderboard):,}")
+    print(f"High-tier senders:          {high_senders:,}")
+    print(f"Personal amount anomalies:  {int(annotated['sender_amount_anomaly'].sum()):,}")
+    print(f"High fan-in receivers:      {int(receivers['high_fan_in'].sum()):,}")
+    print(f"Saved sender leaderboard:   {SENDER_PROFILES_FILE}")
+    print(f"Saved receiver fan-in:      {receivers_path}")
 
 
 if __name__ == "__main__":
